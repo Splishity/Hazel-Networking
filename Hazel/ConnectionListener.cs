@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Net;
 
 namespace Hazel
 {
@@ -80,6 +81,10 @@ namespace Hazel
                 msg.Recycle();
             }
         }
+
+        internal abstract void SendData(byte[] bytes, int length, EndPoint endPoint);
+        internal abstract void SendDataSync(byte[] bytes, int length, EndPoint endPoint);
+        internal abstract bool RemoveConnectionTo(EndPoint endPoint);
 
         /// <summary>
         ///     Closes the connection listener safely.

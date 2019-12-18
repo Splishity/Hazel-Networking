@@ -16,7 +16,7 @@ namespace Hazel.Udp
         ///     Udp server connections utilize the same socket in the listener for sends/receives, this is the listener that 
         ///     created this connection and is hence the listener this conenction sends and receives via.
         /// </remarks>
-        public UdpConnectionListener Listener { get; private set; }
+        public ConnectionListener Listener { get; private set; }
 
         /// <summary>
         ///     Creates a UdpConnection for the virtual connection to the endpoint.
@@ -24,7 +24,7 @@ namespace Hazel.Udp
         /// <param name="listener">The listener that created this connection.</param>
         /// <param name="endPoint">The endpoint that we are connected to.</param>
         /// <param name="IPMode">The IPMode we are connected using.</param>
-        internal UdpServerConnection(UdpConnectionListener listener, IPEndPoint endPoint, IPMode IPMode)
+        internal UdpServerConnection(ConnectionListener listener, IPEndPoint endPoint, IPMode IPMode)
             : base()
         {
             this.Listener = listener;
@@ -65,11 +65,12 @@ namespace Hazel.Udp
         /// </summary>
         protected override bool SendDisconnect(MessageWriter data = null)
         {
-            lock (this)
+            if (!Listener.RemoveConnectionTo(RemoteEndPoint))
             {
-                if (this._state != ConnectionState.Connected) return false;
-                this._state = ConnectionState.NotConnected;
+                return false;
             }
+
+            this._state = ConnectionState.NotConnected;
             
             var bytes = EmptyDisconnectBytes;
             if (data != null && data.Length > 0)
@@ -91,8 +92,6 @@ namespace Hazel.Udp
 
         protected override void Dispose(bool disposing)
         {
-            Listener.RemoveConnectionTo(RemoteEndPoint);
-
             if (disposing)
             {
                 SendDisconnect();

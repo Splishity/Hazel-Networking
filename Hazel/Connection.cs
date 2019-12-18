@@ -164,7 +164,6 @@ namespace Hazel
         /// <param name="timeout">The number of milliseconds to wait before giving up on the connect attempt.</param>
         public abstract void Connect(byte[] bytes = null, int timeout = 5000);
 
-
         /// <summary>
         ///     Connects the connection to a server and begins listening.
         ///     This method does not block.
