@@ -55,8 +55,8 @@ namespace Hazel.Udp
         /// <inheritdoc/>
         public override void Send(MessageWriter msg)
         {
-            if (this._state != ConnectionState.Connected)
-                throw new InvalidOperationException("Could not send data as this Connection is not connected. Did you disconnect?");
+            if (this.State != ConnectionState.Connected)
+                throw new InvalidOperationException("Could not send data as this connection is not connected.");
 
             byte[] buffer = new byte[msg.Length];
             Buffer.BlockCopy(msg.Buffer, 0, buffer, 0, msg.Length);
@@ -194,21 +194,6 @@ namespace Hazel.Udp
             WriteBytesToConnection(bytes, bytes.Length);
 
             Statistics.LogUnreliableSend(length, bytes.Length);
-        }
-
-        /// <summary>
-        ///     Helper method to invoke the data received event.
-        /// </summary>
-        /// <param name="sendOption">The send option the message was received with.</param>
-        /// <param name="buffer">The buffer received.</param>
-        /// <param name="dataOffset">The offset of data in the buffer.</param>
-        void InvokeDataReceived(SendOption sendOption, MessageReader buffer, int dataOffset, int bytesReceived)
-        {
-            buffer.Offset = dataOffset;
-            buffer.Length = bytesReceived - dataOffset;
-            buffer.Position = 0;
-
-            InvokeDataReceived(buffer, sendOption);
         }
 
         /// <summary>

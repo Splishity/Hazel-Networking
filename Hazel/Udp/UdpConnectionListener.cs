@@ -6,13 +6,16 @@ using System.Threading;
 
 namespace Hazel.Udp
 {
-    /// <summary>
-    ///     Listens for new UDP connections and creates UdpConnections for them.
-    /// </summary>
-    /// <inheritdoc />
-    public class UdpConnectionListener : NetworkConnectionListener
+    public class UdpConnectionListener : IConnectionListener, IDisposable
     {
-        private const int SendReceiveBufferSize = 10 * 1024 * 1024;
+        private struct SendQueueData
+        {
+            public byte[] Buffer;
+            public int Length;
+            public EndPoint Remote;
+        }
+
+        private const int SendReceiveBufferSize = 1024 * 1024;
         private const int BufferSize = ushort.MaxValue;
 
         /// <summary>
@@ -23,30 +26,63 @@ namespace Hazel.Udp
         public AcceptConnectionCheck AcceptConnection;
         public delegate bool AcceptConnectionCheck(IPEndPoint endPoint, byte[] input, out byte[] response);
 
+#if DEBUG
+        /// <summary>
+        /// Drops every N messages. 0 is disable (default).
+        /// eg. 1 == Drop every message
+        /// eg. 2 == Drop every other message
+        /// eg. 3 == Drop every third message
+        /// </summary>
+        public int TestDropRate = 0;
+        private int dropRateCounter = 0;
+#endif
+
+        public event Action<NewConnectionEventArgs> NewConnection;
+
         private Socket socket;
-        private Action<string> Logger;
+        private readonly IPEndPoint LocalEndPoint;
+        private readonly IPMode IPMode;
+        
+        private readonly Action<string> Logger;
         private Timer reliablePacketTimer;
 
+        private Thread receiveThread;
+        private Thread sendThread;
+        private HazelThreadPool dispatchThreads;
+
+        private bool disposed;
+
         private ConcurrentDictionary<EndPoint, UdpServerConnection> allConnections = new ConcurrentDictionary<EndPoint, UdpServerConnection>();
-        
+
+        private BlockingCollection<Tuple<MessageReader, EndPoint>> receiveQueue = new BlockingCollection<Tuple<MessageReader, EndPoint>>();
+        private BlockingCollection<SendQueueData> sendQueue = new BlockingCollection<SendQueueData>();
+
         public int ConnectionCount { get { return this.allConnections.Count; } }
+        public int SendQueueLength { get { return this.sendQueue.Count; } }
+        public int ReceiveQueueLength { get { return this.receiveQueue.Count; } }
 
         /// <summary>
         ///     Creates a new UdpConnectionListener for the given <see cref="IPAddress"/>, port and <see cref="IPMode"/>.
         /// </summary>
         /// <param name="endPoint">The endpoint to listen on.</param>
-        public UdpConnectionListener(IPEndPoint endPoint, IPMode ipMode = IPMode.IPv4, Action<string> logger = null)
+        public UdpConnectionListener(int numThreads, IPEndPoint endPoint, IPMode ipMode = IPMode.IPv4, Action<string> logger = null)
         {
             this.Logger = logger;
-            this.EndPoint = endPoint;
+            this.LocalEndPoint = endPoint;
             this.IPMode = ipMode;
 
             this.socket = UdpConnection.CreateSocket(this.IPMode);
-
+            socket.Blocking = false;
             socket.ReceiveBufferSize = SendReceiveBufferSize;
             socket.SendBufferSize = SendReceiveBufferSize;
             
-            reliablePacketTimer = new Timer(ManageReliablePackets, null, 100, Timeout.Infinite);
+            reliablePacketTimer = new Timer(ManageReliablePackets, null, Timeout.Infinite, Timeout.Infinite);
+
+            this.sendThread = new Thread(this.SendLoop);
+            this.sendThread.Name = "SendThread";
+            this.receiveThread = new Thread(this.ReceiveLoop);
+            this.receiveThread.Name = "ReceiveThread";
+            this.dispatchThreads = new HazelThreadPool(numThreads, this.PooledReadCallback);
         }
 
         ~UdpConnectionListener()
@@ -70,120 +106,134 @@ namespace Hazel.Udp
         }
 
         /// <inheritdoc />
-        public override void Start()
+        public void Start()
         {
-            try
-            {
-                socket.Bind(EndPoint);
-            }
-            catch (SocketException e)
-            {
-                throw new HazelException("Could not start listening as a SocketException occurred", e);
-            }
+            socket.Bind(this.LocalEndPoint);
 
-            StartListeningForData();
+            reliablePacketTimer.Change(100, Timeout.Infinite);
+
+            this.sendThread.Start();
+            this.receiveThread.Start();
+            this.dispatchThreads.Start();
         }
 
-        /// <summary>
-        ///     Instructs the listener to begin listening.
-        /// </summary>
-        private void StartListeningForData()
+        private void ReceiveLoop()
         {
-            EndPoint remoteEP = EndPoint;
-
-            MessageReader message = null;
             try
             {
-                message = MessageReader.GetSized(BufferSize);
+                while (!this.disposed)
+                {
+                    if (socket.Poll(-1, SelectMode.SelectRead))
+                    {
+                        MessageReader msg = MessageReader.GetSized(ushort.MaxValue);
+                        EndPoint remoteEP = new IPEndPoint(IPAddress.Any, this.LocalEndPoint.Port);
 
-                socket.BeginReceiveFrom(message.Buffer, 0, message.Buffer.Length, SocketFlags.None, ref remoteEP, ReadCallback, message);
-            }
-            catch (ObjectDisposedException)
-            {
-                message.Recycle();
-                return;
-            }
-            catch (SocketException sx)
-            {
-                message?.Recycle();
+                        try
+                        {
+                            msg.Offset = 0;
+                            msg.Length = socket.ReceiveFrom(msg.Buffer, 0, msg.Buffer.Length, SocketFlags.None, ref remoteEP);
+                        }
+                        catch (Exception sx)
+                        {
+                            msg.Recycle();
+                            this.Logger?.Invoke("Socket Ex in ReadLoop: " + sx.Message);
+                            break;
+                        }
 
-                this.Logger?.Invoke("Socket Ex in StartListening: " + sx.Message);
+#if DEBUG
+                        if (this.TestDropRate > 0)
+                        {
+                            this.dropRateCounter = (this.dropRateCounter + 1) % this.TestDropRate;
+                            if (this.dropRateCounter == 0)
+                            {
+                                msg.Recycle();
+                                continue;
+                            }
+                        }
+#endif
 
-                Thread.Sleep(10);
-                StartListeningForData();
-                return;
+                        try
+                        {
+                            receiveQueue.Add(new Tuple<MessageReader, EndPoint>(msg, remoteEP));
+                        }
+                        catch { }
+                    }
+                    else
+                    {
+                        this.Logger?.Invoke("Socket.Poll returned false.");
+                        break;
+                    }
+                }
             }
-            catch (Exception ex)
+            catch (Exception e)
             {
-                message.Recycle();
-                this.Logger?.Invoke("Stopped due to: " + ex.Message);
-                return;
+                this.Logger?.Invoke("ReadThread exited because: " + e.Message);
             }
         }
 
-        void ReadCallback(IAsyncResult result)
+        private void SendLoop()
         {
-            var message = (MessageReader)result.AsyncState;
-            int bytesReceived;
-            EndPoint remoteEndPoint = new IPEndPoint(IPMode == IPMode.IPv4 ? IPAddress.Any : IPAddress.IPv6Any, 0);
-
-            //End the receive operation
             try
             {
-                bytesReceived = socket.EndReceiveFrom(result, ref remoteEndPoint);
+                while (!this.disposed)
+                {
+                    SendQueueData sendData;
+                    try
+                    {
+                        sendData = sendQueue.Take();
+                    }
+                    catch { break; }
 
-                message.Offset = 0;
-                message.Length = bytesReceived;
+                    try
+                    {
+                        socket.SendTo(sendData.Buffer, 0, sendData.Length, SocketFlags.None, sendData.Remote);
+                    }
+                    catch (Exception sx)
+                    {
+                        this.Logger?.Invoke("Socket Ex in SendLoop: " + sx.Message);
+                        break;
+                    }
+                }
             }
-            catch (ObjectDisposedException)
+            catch (Exception e)
             {
-                message.Recycle();
-                return;
+                this.Logger?.Invoke("SendThread exited because: " + e.Message);
             }
-            catch (InvalidOperationException) { return; } // Callback called twice, somehow...
-            catch (SocketException sx)
+        }
+
+        private void PooledReadCallback()
+        {
+            while (!this.disposed)
             {
-                // Client no longer reachable, pretend it didn't happen
-                // TODO should this not inform the connection this client is lost???
+                Tuple<MessageReader, EndPoint> msg;
+                try
+                {
+                    msg = this.receiveQueue.Take();
+                }
+                catch { break; }
 
-                // This thread suggests the IP is not passed out from WinSoc so maybe not possible
-                // http://stackoverflow.com/questions/2576926/python-socket-error-on-udp-data-receive-10054
-                message.Recycle();
-                this.Logger?.Invoke($"Socket Ex {sx.SocketErrorCode} in ReadCallback: {sx.Message}");
+                var message = msg.Item1;
+                var remoteEndPoint = msg.Item2;
 
-                Thread.Sleep(10);
-                StartListeningForData();
-                return;
+                try
+                {
+                    HandleMessage(message, remoteEndPoint);
+                }
+                catch (Exception e)
+                {
+                    this.Logger?.Invoke("Error while handling message: " + e);
+                }
             }
-            catch (Exception ex)
-            {
-                //If the socket's been disposed then we can just end there.
-                message.Recycle();
-                this.Logger?.Invoke("Stopped due to: " + ex.Message);
-                return;
-            }
+        }
 
-            // I'm a little concerned about a infinite loop here, but it seems like it's possible 
-            // to get 0 bytes read on UDP without the socket being shut down.
-            if (bytesReceived == 0)
-            {
-                message.Recycle();
-                this.Logger?.Invoke("Received 0 bytes");
-                Thread.Sleep(10);
-                StartListeningForData();
-                return;
-            }
-
-            //Begin receiving again
-            StartListeningForData();
-
+        private void HandleMessage(MessageReader message, EndPoint remoteEndPoint)
+        {
             bool aware = true;
             bool isHello = message.Buffer[0] == (byte)UdpSendOption.Hello;
 
             // If we're aware of this connection use the one already
             // If this is a new client then connect with them!
-            UdpServerConnection connection;
-            if (!this.allConnections.TryGetValue(remoteEndPoint, out connection))
+            if (!this.allConnections.TryGetValue(remoteEndPoint, out var connection))
             {
                 lock (this.allConnections)
                 {
@@ -214,15 +264,16 @@ namespace Hazel.Udp
                         connection = new UdpServerConnection(this, (IPEndPoint)remoteEndPoint, this.IPMode);
                         if (!this.allConnections.TryAdd(remoteEndPoint, connection))
                         {
-                            throw new HazelException("Failed to add a connection. This should never happen.");
+                            throw new Exception("Failed to add a connection. This should never happen.");
                         }
                     }
                 }
             }
 
             //Inform the connection of the buffer (new connections need to send an ack back to client)
+            var bytesReceived = message.Length;
             connection.HandleReceive(message, bytesReceived);
-            
+
             //If it's a new connection invoke the NewConnection event.
             if (!aware)
             {
@@ -230,7 +281,12 @@ namespace Hazel.Udp
                 message.Offset = 4;
                 message.Length = bytesReceived - 4;
                 message.Position = 0;
-                InvokeNewConnection(message, connection);
+
+                var handler = NewConnection;
+                if (handler != null)
+                {
+                    handler(new NewConnectionEventArgs(message, connection));
+                }
             }
             else if (isHello)
             {
@@ -238,59 +294,15 @@ namespace Hazel.Udp
             }
         }
 
-#if DEBUG
-        public int TestDropRate = -1;
-        private int dropCounter = 0;
-#endif
-
-        /// <summary>
-        ///     Sends data from the listener socket.
-        /// </summary>
-        /// <param name="bytes">The bytes to send.</param>
-        /// <param name="endPoint">The endpoint to send to.</param>
-        internal override void SendData(byte[] bytes, int length, EndPoint endPoint)
+        /// <inheritdoc />
+        public void SendData(byte[] bytes, int length, EndPoint endPoint)
         {
-            if (length > bytes.Length) return;
-
-#if DEBUG
-            if (TestDropRate > 0)
+            sendQueue.Add(new SendQueueData
             {
-                if (Interlocked.Increment(ref dropCounter) % TestDropRate == 0)
-                {
-                    return;
-                }
-            }
-#endif
-
-            try
-            {
-                socket.BeginSendTo(
-                    bytes,
-                    0,
-                    length,
-                    SocketFlags.None,
-                    endPoint,
-                    SendCallback,
-                    null);
-            }
-            catch (SocketException e)
-            {
-                throw new HazelException("Could not send data as a SocketException occurred.", e);
-            }
-            catch (ObjectDisposedException)
-            {
-                //Keep alive timer probably ran, ignore
-                return;
-            }
-        }
-
-        private void SendCallback(IAsyncResult result)
-        {
-            try
-            {
-                socket.EndSendTo(result);
-            }
-            catch { }
+                Buffer = bytes,
+                Length = length,
+                Remote = endPoint
+            });
         }
 
         /// <summary>
@@ -298,7 +310,7 @@ namespace Hazel.Udp
         /// </summary>
         /// <param name="bytes">The bytes to send.</param>
         /// <param name="endPoint">The endpoint to send to.</param>
-        internal override void SendDataSync(byte[] bytes, int length, EndPoint endPoint)
+        public void SendDataSync(byte[] bytes, int length, EndPoint endPoint)
         {
             try
             {
@@ -317,26 +329,49 @@ namespace Hazel.Udp
         ///     Removes a virtual connection from the list.
         /// </summary>
         /// <param name="endPoint">The endpoint of the virtual connection.</param>
-        internal override bool RemoveConnectionTo(EndPoint endPoint)
+        public bool RemoveConnectionTo(EndPoint endPoint)
         {
-            return this.allConnections.TryRemove(endPoint, out var conn);
+            return this.allConnections.TryRemove(endPoint, out _);
+        }
+
+        public void Dispose()
+        {
+            GC.SuppressFinalize(this);
+            this.Dispose(true);
         }
 
         /// <inheritdoc />
-        protected override void Dispose(bool disposing)
+        protected void Dispose(bool disposing)
         {
+            this.disposed = true;
+            this.reliablePacketTimer.Dispose();
+
+            try
+            {
+                this.sendQueue.CompleteAdding();
+                this.sendQueue.Dispose();
+            }
+            catch { }
+            try
+            {
+                this.receiveQueue.CompleteAdding();
+                this.receiveQueue.Dispose();
+            }
+            catch { }
+
             foreach (var kvp in this.allConnections)
             {
-                kvp.Value.Dispose();
+                var sock = kvp.Value;
+                sock.Dispose();
             }
 
             try { this.socket.Shutdown(SocketShutdown.Both); } catch { }
             try { this.socket.Close(); } catch { }
             try { this.socket.Dispose(); } catch { }
 
-            this.reliablePacketTimer.Dispose();
-
-            base.Dispose(disposing);
+            this.sendThread.Join();
+            this.receiveThread.Join();
+            this.dispatchThreads.Join();
         }
     }
 }

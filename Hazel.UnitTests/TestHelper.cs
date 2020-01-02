@@ -5,6 +5,7 @@ using Hazel;
 using System.Net;
 using System.Threading;
 using System.Diagnostics;
+using Hazel.Udp;
 
 namespace Hazel.UnitTests
 {
@@ -16,7 +17,7 @@ namespace Hazel.UnitTests
         /// </summary>
         /// <param name="listener">The listener to test.</param>
         /// <param name="connection">The connection to test.</param>
-        internal static void RunServerToClientTest(NetworkConnectionListener listener, Connection connection, int dataSize, SendOption sendOption)
+        internal static void RunServerToClientTest(UdpConnectionListener listener, UdpClientConnection connection, int dataSize, SendOption sendOption)
         {
             //Setup meta stuff 
             byte[] data = BuildData(dataSize);
@@ -66,7 +67,7 @@ namespace Hazel.UnitTests
         /// </summary>
         /// <param name="listener">The listener to test.</param>
         /// <param name="connection">The connection to test.</param>
-        internal static void RunClientToServerTest(NetworkConnectionListener listener, Connection connection, int dataSize, SendOption sendOption)
+        internal static void RunClientToServerTest(UdpConnectionListener listener, UdpClientConnection connection, int dataSize, SendOption sendOption)
         {
             //Setup meta stuff 
             byte[] data = BuildData(dataSize);
@@ -116,7 +117,7 @@ namespace Hazel.UnitTests
         /// </summary>
         /// <param name="listener">The listener to test.</param>
         /// <param name="connection">The connection to test.</param>
-        internal static void RunServerDisconnectTest(NetworkConnectionListener listener, Connection connection)
+        internal static void RunServerDisconnectTest(UdpConnectionListener listener, UdpClientConnection connection)
         {
             ManualResetEvent mutex = new ManualResetEvent(false);
 
@@ -142,7 +143,7 @@ namespace Hazel.UnitTests
         /// </summary>
         /// <param name="listener">The listener to test.</param>
         /// <param name="connection">The connection to test.</param>
-        internal static void RunClientDisconnectTest(NetworkConnectionListener listener, Connection connection)
+        internal static void RunClientDisconnectTest(UdpConnectionListener listener, UdpClientConnection connection)
         {
             ManualResetEvent mutex = new ManualResetEvent(false);
             ManualResetEvent mutex2 = new ManualResetEvent(false);

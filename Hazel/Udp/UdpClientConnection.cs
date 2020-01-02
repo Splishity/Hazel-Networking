@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -7,137 +8,154 @@ using System.Threading;
 namespace Hazel.Udp
 {
     /// <summary>
-    ///     Represents a client's connection to a server that uses the UDP protocol.
+    /// Represents a client's connection to a server that uses the UDP protocol.
     /// </summary>
+    /// <remarks>
+    /// Usage:
+    /// 1. Create
+    /// 2. Connect
+    /// 3. Send (Recycle MessageWriters)
+    /// 4. Receive (Recycle MessageReaders)
+    /// 5a. Disconnect locally (Optional, sends message synchronously to remote)
+    /// 5b. Remote sends disconnect (Don't dispose in callback)
+    /// 6. Dispose (Doesn't send message to remote);
+    /// </remarks>
     /// <inheritdoc/>
-    public sealed class UdpClientConnection : UdpConnection
+    public class UdpClientConnection : UdpConnection
     {
-        /// <summary>
-        ///     The socket we're connected via.
-        /// </summary>
         private Socket socket;
+        private Action<string> logger;
 
-        /// <summary>
-        ///     Reset event that is triggered when the connection is marked Connected.
-        /// </summary>
-        private ManualResetEvent connectWaitLock = new ManualResetEvent(false);
+        private Thread receiveThread;
+        private Thread sendThread;
+        private HazelThreadPool dispatchThreads;
 
-        private Timer reliablePacketTimer;
+        private bool disposed;
 
-#if DEBUG
-        public event Action<byte[], int> DataSentRaw;
-        public event Action<byte[], int> DataReceivedRaw;
-#endif
+        private BlockingCollection<MessageReader> receiveQueue = new BlockingCollection<MessageReader>();
+        private BlockingCollection<Tuple<byte[], int>> sendQueue = new BlockingCollection<Tuple<byte[], int>>();
 
         /// <summary>
         ///     Creates a new UdpClientConnection.
         /// </summary>
         /// <param name="remoteEndPoint">A <see cref="NetworkEndPoint"/> to connect to.</param>
-        public UdpClientConnection(IPEndPoint remoteEndPoint, IPMode ipMode = IPMode.IPv4)
+        public UdpClientConnection(int numThreads, IPEndPoint remoteEndPoint, IPMode ipMode = IPMode.IPv4, Action<string> logger = null)
             : base()
         {
-            this.EndPoint = remoteEndPoint;
             this.RemoteEndPoint = remoteEndPoint;
             this.IPMode = ipMode;
+            this.logger = logger;
 
             this.socket = CreateSocket(ipMode);
+            this.socket.Blocking = false;
 
-            reliablePacketTimer = new Timer(ManageReliablePacketsInternal, null, 100, Timeout.Infinite);
+            this.sendThread = new Thread(this.SendLoop);
+            this.sendThread.Name = "SendThread";
+            this.receiveThread = new Thread(this.ReceiveLoop);
+            this.receiveThread.Name = "ReceiveThread";
+            this.dispatchThreads = new HazelThreadPool(numThreads, this.PooledReadCallback);
         }
-        
+
         ~UdpClientConnection()
         {
             this.Dispose(false);
         }
 
-        private void ManageReliablePacketsInternal(object state)
+        public void FixedUpdate()
         {
             base.ManageReliablePackets();
-            try
+        }
+
+        private void ReceiveLoop()
+        {
+            while (!this.disposed)
             {
-                reliablePacketTimer.Change(100, Timeout.Infinite);
+                if (socket.Poll(-1, SelectMode.SelectRead))
+                {
+                    MessageReader msg = MessageReader.GetSized(ushort.MaxValue);
+
+                    try
+                    {
+                        msg.Offset = 0;
+                        msg.Length = socket.Receive(msg.Buffer, 0, msg.Buffer.Length, SocketFlags.None);
+                    }
+                    catch (SocketException ex)
+                    {
+                        msg.Recycle();
+                        Disconnect("Could not read data as a SocketException occurred: " + ex.Message);
+                        break;
+                    }
+                    catch (Exception e)
+                    {
+                        this.logger?.Invoke("ClientException in ReadLoop: " + e.Message);
+                        msg.Recycle();
+                        break;
+                    }
+
+                    try
+                    {
+                        receiveQueue.Add(msg);
+                    }
+                    catch { break; }
+                }
+                else
+                {
+                    Disconnect("Socket.Poll returned false.");
+                    break;
+                }
             }
-            catch { }
+        }
+
+        private void SendLoop()
+        {
+            while (!this.disposed)
+            {
+                Tuple<byte[], int> bytesAndLength;
+                try
+                {
+                    bytesAndLength = sendQueue.Take();
+                }
+                catch { break; }
+
+                try
+                {
+                    socket.SendTo(bytesAndLength.Item1, 0, bytesAndLength.Item2, SocketFlags.None, this.RemoteEndPoint);
+                }
+                catch (SocketException ex)
+                {
+                    Disconnect("Could not send data as a SocketException occurred: " + ex.Message);
+                    break;
+                }
+                catch (Exception e)
+                {
+                    this.logger?.Invoke("ClientException in SendLoop: " + e.Message);
+                    break;
+                }
+            }
         }
 
         /// <inheritdoc />
         protected override void WriteBytesToConnection(byte[] bytes, int length)
         {
-#if DEBUG
-            if (TestLagMs > 0)
-            {
-                ThreadPool.QueueUserWorkItem(a => { Thread.Sleep(this.TestLagMs); WriteBytesToConnectionReal(bytes, length); });
-            }
-            else
-#endif
-            {
-                WriteBytesToConnectionReal(bytes, length);
-            }
-        }
-
-        private void WriteBytesToConnectionReal(byte[] bytes, int length)
-        {
-#if DEBUG
-            DataSentRaw?.Invoke(bytes, length);
-#endif
-
             try
             {
-                socket.BeginSendTo(
-                    bytes,
-                    0,
-                    length,
-                    SocketFlags.None,
-                    RemoteEndPoint,
-                    HandleSendTo,
-                    null);
+                sendQueue.Add(new Tuple<byte[], int>(bytes, length));
             }
-            catch (NullReferenceException) { }
-            catch (ObjectDisposedException)
-            {
-                // Already disposed and disconnected...
-            }
-            catch (SocketException ex)
-            {
-                Disconnect("Could not send data as a SocketException occurred: " + ex.Message);
-            }
+            catch { }
         }
 
-        private void HandleSendTo(IAsyncResult result)
-        {
-            try
-            {
-                socket.EndSendTo(result);
-            }
-            catch (NullReferenceException) { }
-            catch (ObjectDisposedException)
-            {
-                // Already disposed and disconnected...
-            }
-            catch (SocketException ex)
-            {
-                Disconnect("Could not send data as a SocketException occurred: " + ex.Message);
-            }
-        }
-
-        /// <inheritdoc />
-        public override void Connect(byte[] bytes = null, int timeout = 5000)
+        public void Connect(byte[] bytes = null, int timeout = 5000)
         {
             this.ConnectAsync(bytes, timeout);
 
-            //Wait till hello packet is acknowledged and the state is set to Connected
-            bool timedOut = !WaitOnConnect(timeout);
-
-            //If we timed out raise an exception
-            if (timedOut)
+            while (this.State == ConnectionState.Connecting)
             {
-                Dispose();
-                throw new HazelException("Connection attempt timed out.");
+                Thread.Sleep(1);
             }
         }
 
         /// <inheritdoc />
-        public override void ConnectAsync(byte[] bytes = null, int timeout = 5000)
+        public void ConnectAsync(byte[] bytes = null, int timeout = 5000)
         {
             this.State = ConnectionState.Connecting;
 
@@ -148,28 +166,15 @@ namespace Hazel.Udp
                 else
                     socket.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
             }
-            catch (SocketException e)
+            catch (SocketException)
             {
                 this.State = ConnectionState.NotConnected;
-                throw new HazelException("A SocketException occurred while binding to the port.", e);
+                throw;
             }
 
-            try
-            {
-                StartListeningForData();
-            }
-            catch (ObjectDisposedException)
-            {
-                // If the socket's been disposed then we can just end there but make sure we're in NotConnected state.
-                // If we end up here I'm really lost...
-                this.State = ConnectionState.NotConnected;
-                return;
-            }
-            catch (SocketException e)
-            {
-                Dispose();
-                throw new HazelException("A SocketException occurred while initiating a receive operation.", e);
-            }
+            this.receiveThread.Start();
+            this.sendThread.Start();
+            this.dispatchThreads.Start();
 
             // Write bytes to the server to tell it hi (and to punch a hole in our NAT, if present)
             // When acknowledged set the state to connected
@@ -180,106 +185,37 @@ namespace Hazel.Udp
             });
         }
 
-        /// <summary>
-        ///     Instructs the listener to begin listening.
-        /// </summary>
-        void StartListeningForData()
+        private void PooledReadCallback()
         {
-#if DEBUG
-            if (this.TestLagMs > 0)
+            while (!this.disposed)
             {
-                Thread.Sleep(this.TestLagMs);
-            }
-#endif
-
-            var msg = MessageReader.GetSized(ushort.MaxValue);
-            try
-            {
-                socket.BeginReceive(msg.Buffer, 0, msg.Buffer.Length, SocketFlags.None, ReadCallback, msg);
-            }
-            catch
-            {
-                msg.Recycle();
-                this.Dispose();
-            }
-        }
-
-        protected override void SetState(ConnectionState state)
-        {
-            if (state == ConnectionState.Connected)
-                connectWaitLock.Set();
-            else
-                connectWaitLock.Reset();
-        }
-
-        /// <summary>
-        ///     Blocks until the Connection is connected.
-        /// </summary>
-        /// <param name="timeout">The number of milliseconds to wait before timing out.</param>
-        public bool WaitOnConnect(int timeout)
-        {
-            return connectWaitLock.WaitOne(timeout);
-        }
-
-        /// <summary>
-        ///     Called when data has been received by the socket.
-        /// </summary>
-        /// <param name="result">The asyncronous operation's result.</param>
-        void ReadCallback(IAsyncResult result)
-        {
-            var msg = (MessageReader)result.AsyncState;
-
-            try
-            {
-                msg.Length = socket.EndReceive(result);
-            }
-            catch (SocketException e)
-            {
-                msg.Recycle();
-                Disconnect("Socket exception while reading data: " + e.Message);
-                return;
-            }
-            catch (Exception)
-            {
-                msg.Recycle();
-                return;
-            }
-
-            //Exit if no bytes read, we've failed.
-            if (msg.Length == 0)
-            {
-                msg.Recycle();
-                Disconnect("Received 0 bytes");
-                return;
-            }
-
-            //Begin receiving again
-            try
-            {
-                StartListeningForData();
-            }
-            catch (SocketException e)
-            {
-                Disconnect("Socket exception during receive: " + e.Message);
-            }
-            catch (ObjectDisposedException)
-            {
-                //If the socket's been disposed then we can just end there.
-                return;
-            }
-
-#if DEBUG
-            if (this.TestDropRate > 0)
-            {
-                if ((this.testDropCount++ % this.TestDropRate) == 0)
+                try
                 {
-                    return;
+                    MessageReader msg;
+                    try
+                    {
+                        msg = this.receiveQueue.Take();
+                    }
+                    catch { break; }
+
+                    HandleReceive(msg, msg.Length);
+                }
+                catch (Exception e)
+                {
+                    this.logger?.Invoke("ClientException in dispatch: " + e.Message);
                 }
             }
+        }
 
-            DataReceivedRaw?.Invoke(msg.Buffer, msg.Length);
-#endif
-            HandleReceive(msg, msg.Length);
+        protected override void DisconnectRemote(string reason, MessageReader reader)
+        {
+            lock (this)
+            {
+                if (this.State == ConnectionState.NotConnected) return;
+                this.State = ConnectionState.NotConnected;
+            }
+            
+            InvokeDisconnectHandler(reason, reader);
         }
 
         /// <summary>
@@ -290,8 +226,8 @@ namespace Hazel.Udp
         {
             lock (this)
             {
-                if (this._state == ConnectionState.NotConnected) return false;
-                this._state = ConnectionState.NotConnected;
+                if (this.State == ConnectionState.NotConnected) return false;
+                this.State = ConnectionState.NotConnected;
             }
 
             var bytes = EmptyDisconnectBytes;
@@ -320,17 +256,27 @@ namespace Hazel.Udp
         /// <inheritdoc />
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            this.disposed = true;
+            try
             {
-                SendDisconnect();
+                this.sendQueue.CompleteAdding();
+                this.sendQueue.Dispose();
             }
+            catch { }
+            try
+            {
+                this.receiveQueue.CompleteAdding();
+                this.receiveQueue.Dispose();
+            }
+            catch { }
 
             try { this.socket.Shutdown(SocketShutdown.Both); } catch { }
             try { this.socket.Close(); } catch { }
             try { this.socket.Dispose(); } catch { }
 
-            this.reliablePacketTimer.Dispose();
-            this.connectWaitLock.Dispose();
+            this.sendThread.Join();
+            this.receiveThread.Join();
+            this.dispatchThreads.Join();
 
             base.Dispose(disposing);
         }

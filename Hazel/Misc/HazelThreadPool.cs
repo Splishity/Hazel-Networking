@@ -31,7 +31,12 @@ namespace Hazel
         {
             for (int i = 0; i < this.threads.Length; ++i)
             {
-                this.threads[i].Join();
+                var thread = this.threads[i];
+                try
+                {
+                    thread.Join();
+                }
+                catch { }
             }
         }
     }

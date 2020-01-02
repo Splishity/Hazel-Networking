@@ -4,8 +4,17 @@ using System.Net;
 namespace Hazel.Udp
 {
     /// <summary>
-    ///     Represents a servers's connection to a client that uses the UDP protocol.
+    /// Represents a servers's connection to a client that uses the UDP protocol.
     /// </summary>
+    /// <remarks>
+    /// Usage:
+    /// 1. Created from UdpServerListener
+    /// 3. Send (Recycle MessageWriters)
+    /// 4. Receive (Recycle MessageReaders)
+    /// 5a. Disconnect locally (Optional, sends message synchronously to remote)
+    /// 5b. Remote sends disconnect (Connection will be disposed for you.)
+    /// 6. Dispose (Doesn't send message to remote)
+    /// </remarks>
     /// <inheritdoc/>
     internal sealed class UdpServerConnection : UdpConnection
     {
@@ -16,7 +25,7 @@ namespace Hazel.Udp
         ///     Udp server connections utilize the same socket in the listener for sends/receives, this is the listener that 
         ///     created this connection and is hence the listener this conenction sends and receives via.
         /// </remarks>
-        public ConnectionListener Listener { get; private set; }
+        public IConnectionListener Listener { get; private set; }
 
         /// <summary>
         ///     Creates a UdpConnection for the virtual connection to the endpoint.
@@ -24,12 +33,11 @@ namespace Hazel.Udp
         /// <param name="listener">The listener that created this connection.</param>
         /// <param name="endPoint">The endpoint that we are connected to.</param>
         /// <param name="IPMode">The IPMode we are connected using.</param>
-        internal UdpServerConnection(ConnectionListener listener, IPEndPoint endPoint, IPMode IPMode)
+        internal UdpServerConnection(IConnectionListener listener, IPEndPoint endPoint, IPMode IPMode)
             : base()
         {
             this.Listener = listener;
             this.RemoteEndPoint = endPoint;
-            this.EndPoint = endPoint;
             this.IPMode = IPMode;
 
             State = ConnectionState.Connected;
@@ -42,24 +50,6 @@ namespace Hazel.Udp
             Listener.SendData(bytes, length, RemoteEndPoint);
         }
 
-        /// <inheritdoc />
-        /// <remarks>
-        ///     This will always throw a HazelException.
-        /// </remarks>
-        public override void Connect(byte[] bytes = null, int timeout = 5000)
-        {
-            throw new InvalidOperationException("Cannot manually connect a UdpServerConnection, did you mean to use UdpClientConnection?");
-        }
-
-        /// <inheritdoc />
-        /// <remarks>
-        ///     This will always throw a HazelException.
-        /// </remarks>
-        public override void ConnectAsync(byte[] bytes = null, int timeout = 5000)
-        {
-            throw new InvalidOperationException("Cannot manually connect a UdpServerConnection, did you mean to use UdpClientConnection?");
-        }
-
         /// <summary>
         ///     Sends a disconnect message to the end point.
         /// </summary>
@@ -70,7 +60,7 @@ namespace Hazel.Udp
                 return false;
             }
 
-            this._state = ConnectionState.NotConnected;
+            this.State = ConnectionState.NotConnected;
             
             var bytes = EmptyDisconnectBytes;
             if (data != null && data.Length > 0)
@@ -90,13 +80,26 @@ namespace Hazel.Udp
             return true;
         }
 
+        protected override void DisconnectRemote(string reason, MessageReader reader)
+        {
+            if (this.Listener.RemoveConnectionTo(this.RemoteEndPoint))
+            {
+                InvokeDisconnectHandler(reason, reader);
+                this.Dispose();
+            }
+        }
+
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            if (this.Listener.RemoveConnectionTo(this.RemoteEndPoint))
             {
-                SendDisconnect();
+                try
+                {
+                    this.Listener.SendDataSync(EmptyDisconnectBytes, EmptyDisconnectBytes.Length, this.RemoteEndPoint);
+                }
+                catch { }
             }
-
+            
             base.Dispose(disposing);
         }
     }

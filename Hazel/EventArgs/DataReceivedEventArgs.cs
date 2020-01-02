@@ -7,19 +7,19 @@ namespace Hazel
 {
     public struct DataReceivedEventArgs
     {
-        public readonly Connection Sender;
+        public readonly NetworkConnection Sender;
 
         /// <summary>
-        ///     The bytes received from the client.
+        /// The bytes received from the client. You must recycle this.
         /// </summary>
         public readonly MessageReader Message;
 
         /// <summary>
-        ///     The <see cref="SendOption"/> the data was sent with.
+        /// The <see cref="SendOption"/> the data was sent with.
         /// </summary>
         public readonly SendOption SendOption;
         
-        public DataReceivedEventArgs(Connection sender, MessageReader msg, SendOption sendOption)
+        public DataReceivedEventArgs(NetworkConnection sender, MessageReader msg, SendOption sendOption)
         {
             this.Sender = sender;
             this.Message = msg;

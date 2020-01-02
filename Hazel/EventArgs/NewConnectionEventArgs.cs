@@ -11,9 +11,9 @@
         /// <summary>
         /// The <see cref="Connection"/> to the new client.
         /// </summary>
-        public readonly Connection Connection;
+        public readonly NetworkConnection Connection;
 
-        public NewConnectionEventArgs(MessageReader handshakeData, Connection connection)
+        public NewConnectionEventArgs(MessageReader handshakeData, NetworkConnection connection)
         {
             this.HandshakeData = handshakeData;
             this.Connection = connection;
