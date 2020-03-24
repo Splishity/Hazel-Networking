@@ -11,6 +11,8 @@ namespace Hazel.Udp
 {
     partial class UdpConnection
     {
+        protected const int AckSizeBytes = 7;
+
         /// <summary>
         ///     The starting timeout, in miliseconds, at which data will be resent.
         /// </summary>
@@ -51,17 +53,12 @@ namespace Hazel.Udp
         /// <summary>
         ///     The last packets that were received.
         /// </summary>
-        private HashSet<ushort> reliableDataPacketsMissing = new HashSet<ushort>();
+        private ulong missingDataPackets;
 
         /// <summary>
         ///     The packet id that was received last.
         /// </summary>
-        private volatile ushort reliableReceiveLast = 0;
-
-        /// <summary>
-        ///     Has the connection received anything yet
-        /// </summary>
-        private volatile bool hasReceivedSomething = false;
+        private volatile ushort reliableReceiveLast = ushort.MaxValue;
 
         private object PingLock = new object();
 
@@ -152,6 +149,13 @@ namespace Hazel.Udp
                             self.Recycle();
                         }
 
+                        return 0;
+                    }
+
+                    ushort last = (ushort)(connection.lastIDAllocated - 64);
+                    if (IsUshortNewer(last, this.Id))
+                    {
+                        connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {this.Id} (size={this.Length}) was unable to be ack'd after {lifetime}ms ({this.Retransmissions} resends)");
                         return 0;
                     }
 
@@ -328,10 +332,7 @@ namespace Hazel.Udp
 
             //Get the ID form the packet
             id = (ushort)((b1 << 8) + b2);
-
-            //Send an acknowledgement
-            SendAck(b1, b2);
-
+            
             /*
              * It gets a little complicated here (note the fact I'm actually using a multiline comment for once...)
              * 
@@ -352,49 +353,68 @@ namespace Hazel.Udp
              * 
              * Anything behind than the reliableReceiveLast pointer (but greater than the overwritePointer is either a 
              * missing packet or something we've already received so when we change the pointers we need to make sure 
-             * we keep note of what hasn't been received yet (reliableDataPacketsMissing).
+             * we keep note of what hasn't been received yet (missingDataPackets).
              * 
              * So...
              */
-            
-            lock (reliableDataPacketsMissing)
+
+            lock (reliableDataPacketsSent)
             {
-                //Calculate overwritePointer
-                ushort overwritePointer = (ushort)(reliableReceiveLast - 32768);
+                // Calculate if it is a new packet by examining if it is within the range
+                bool isNew = IsUshortNewer(id, reliableReceiveLast);
 
-                //Calculate if it is a new packet by examining if it is within the range
-                bool isNew;
-                if (overwritePointer < reliableReceiveLast)
-                    isNew = id > reliableReceiveLast || id <= overwritePointer;     //Figure (2)
-                else
-                    isNew = id > reliableReceiveLast && id <= overwritePointer;     //Figure (3)
-                
-                //If it's new or we've not received anything yet
-                if (isNew || !hasReceivedSomething)
+                // If it's new or we've not received anything yet
+                // Mark items between the most recent receive and the id received as missing
+                if (isNew)
                 {
-                    //Mark items between the most recent receive and the id received as missing
-                    for (ushort i = (ushort)(reliableReceiveLast + 1); i < id; i++)
-                    {
-                        reliableDataPacketsMissing.Add(i);
-                    }
+                    if (id < reliableReceiveLast)
+                        missingDataPackets <<= id + ushort.MaxValue - reliableReceiveLast;
+                    else
+                        missingDataPackets <<= id - reliableReceiveLast;
 
-                    //Update the most recently received
+                    // Update the most recently received
+                    missingDataPackets |= 1;
                     reliableReceiveLast = id;
-                    hasReceivedSomething = true;
+                    
+                    SendAck();
                 }
-                
-                //Else it could be a missing packet
                 else
                 {
-                    //See if we're missing it, else this packet is a duplicate as so we return false
-                    if (!reliableDataPacketsMissing.Remove(id))
+                    // Else it could be a missing packet
+                    // See if we're missing it, else this packet is a duplicate as so we return false
+                    if (id <= reliableReceiveLast)
                     {
-                        return false;
+                        uint msgBit = 1u << (reliableReceiveLast - id);
+                        if ((missingDataPackets & msgBit) != 0)
+                        {
+                            return false;
+                        }
+
+                        missingDataPackets |= msgBit;
+                    }
+                    else
+                    {
+                        uint msgBit = 1u << (reliableReceiveLast + ushort.MaxValue - id);
+                        if ((missingDataPackets & msgBit) != 0)
+                        {
+                            return false;
+                        }
+
+                        missingDataPackets |= msgBit;
                     }
                 }
             }
 
             return true;
+        }
+
+        private static bool IsUshortNewer(ushort id, ushort reliableReceiveLast)
+        {
+            ushort overwritePointer = (ushort)(reliableReceiveLast - 32768);
+            if (overwritePointer < reliableReceiveLast)
+                return id > reliableReceiveLast || id <= overwritePointer;     //Figure (2)
+            else
+                return id > reliableReceiveLast && id <= overwritePointer;     //Figure (3)
         }
 
         /// <summary>
@@ -405,9 +425,29 @@ namespace Hazel.Udp
         {
             this.pingsSinceAck = 0;
 
-            //Get ID
+            // Get ID
             ushort id = (ushort)((bytes[1] << 8) + bytes[2]);
+            if (bytesReceived >= 7)
+            {
+                uint ackField = (uint)bytes[3] << 24 | (uint)bytes[4] << 16 | (uint)bytes[5] << 8 | (uint)bytes[6] << 0;
+                for (ushort off = 0; off < 32; ++off)
+                {
+                    if ((ackField & (1u << off)) != 0)
+                    {
+                        AcknowledgeMessageId((ushort)(id - off));
+                    }
+                }
+            }
+            else
+            {
+                AcknowledgeMessageId(id);
+            }
 
+            Statistics.LogReliableReceive(bytesReceived - AckSizeBytes, bytesReceived);
+        }
+
+        private void AcknowledgeMessageId(ushort id)
+        {
             // Dispose of timer and remove from dictionary
             if (reliableDataPacketsSent.TryRemove(id, out Packet packet))
             {
@@ -432,26 +472,26 @@ namespace Hazel.Udp
                     this.AveragePingMs = Math.Max(50, this.AveragePingMs * .7f + rt * .3f);
                 }
             }
-
-            Statistics.LogReliableReceive(bytesReceived - 3, bytesReceived);
         }
 
         /// <summary>
-        ///     Sends an acknowledgement for a packet given its identification bytes.
+        /// Sends an acknowledgement for a packet given its identification bytes.
         /// </summary>
         /// <param name="byte1">The first identification byte.</param>
         /// <param name="byte2">The second identification byte.</param>
-        private void SendAck(byte byte1, byte byte2)
+        private void SendAck()
         {
             byte[] bytes = new byte[]
             {
                 (byte)UdpSendOption.Acknowledgement,
-                byte1,
-                byte2
+                (byte)(reliableReceiveLast >> 8),
+                (byte)(reliableReceiveLast >> 0),
+                (byte)(missingDataPackets >> 24),
+                (byte)(missingDataPackets >> 16),
+                (byte)(missingDataPackets >> 8),
+                (byte)(missingDataPackets >> 0),
             };
 
-            // Always reply with acknowledgement in order to stop the sender repeatedly sending it
-            // TODO: group acks together
             try
             {
                 WriteBytesToConnection(bytes, bytes.Length);

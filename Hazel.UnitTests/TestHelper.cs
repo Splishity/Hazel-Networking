@@ -112,32 +112,6 @@ namespace Hazel.UnitTests
         }
 
         /// <summary>
-        ///     Runs a server disconnect test on the given listener and connection.
-        /// </summary>
-        /// <param name="listener">The listener to test.</param>
-        /// <param name="connection">The connection to test.</param>
-        internal static void RunServerDisconnectTest(NetworkConnectionListener listener, Connection connection)
-        {
-            ManualResetEvent mutex = new ManualResetEvent(false);
-
-            connection.Disconnected += delegate(object sender, DisconnectedEventArgs args)
-            {
-                mutex.Set();
-            };
-
-            listener.NewConnection += delegate(NewConnectionEventArgs args)
-            {
-                args.Connection.Disconnect("Testing");
-            };
-
-            listener.Start();
-
-            connection.Connect();
-
-            mutex.WaitOne();
-        }
-
-        /// <summary>
         ///     Runs a client disconnect test on the given listener and connection.
         /// </summary>
         /// <param name="listener">The listener to test.</param>

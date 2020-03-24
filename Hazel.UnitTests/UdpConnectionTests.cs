@@ -380,7 +380,7 @@ namespace Hazel.UnitTests
         }
 
         /// <summary>
-        ///     Tests disconnection from the server.
+        /// Tests disconnection from the server.
         /// </summary>
         [TestMethod]
         public void ServerDisconnectTest()
@@ -388,7 +388,30 @@ namespace Hazel.UnitTests
             using (UdpConnectionListener listener = new UdpConnectionListener(new IPEndPoint(IPAddress.Any, 4296)))
             using (UdpConnection connection = new UdpClientConnection(new IPEndPoint(IPAddress.Loopback, 4296)))
             {
-                TestHelper.RunServerDisconnectTest(listener, connection);
+                ManualResetEvent mutex = new ManualResetEvent(false);
+
+                connection.Disconnected += delegate (object sender, DisconnectedEventArgs args)
+                {
+                    mutex.Set();
+                };
+
+                Connection client = null;
+                listener.NewConnection += delegate (NewConnectionEventArgs args)
+                {
+                    client = args.Connection;
+                };
+
+                listener.Start();
+
+                connection.Connect();
+
+                Assert.IsNotNull(client);
+                client.Disconnect("Testing");
+
+                mutex.WaitOne();
+
+                Assert.AreEqual(0, listener.ConnectionCount);
+                Assert.AreEqual(ConnectionState.NotConnected, connection.State);
             }
         }
 
@@ -410,16 +433,20 @@ namespace Hazel.UnitTests
                     mutex.Set();
                 };
 
+                Connection client = null;
                 listener.NewConnection += delegate (NewConnectionEventArgs args)
                 {
-                    MessageWriter writer = MessageWriter.Get(SendOption.None);
-                    writer.Write("Goodbye");
-                    args.Connection.Disconnect("Testing", writer);
+                    client = args.Connection;
                 };
 
                 listener.Start();
 
                 connection.Connect();
+
+                Assert.IsNotNull(client);
+                MessageWriter writer = MessageWriter.Get(SendOption.None);
+                writer.Write("Goodbye");
+                client.Disconnect("Testing", writer);
 
                 mutex.WaitOne();
 
