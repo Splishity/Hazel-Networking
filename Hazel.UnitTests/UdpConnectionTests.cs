@@ -7,7 +7,7 @@ using Hazel.Udp;
 namespace Hazel.UnitTests
 {
     [TestClass]
-    public class UdpConnectionTests
+    public partial class UdpConnectionTests
     {
         [TestMethod]
         public void ServerDisposeDisconnectsTest()

@@ -58,6 +58,14 @@ namespace Hazel.Udp
             if (this._state != ConnectionState.Connected)
                 throw new InvalidOperationException("Could not send data as this Connection is not connected. Did you disconnect?");
 
+            if (AutomaticFragmentation 
+                && msg.Length > MTUSizeInBytes)
+            {
+                byte[] fragBuffer = msg.ToByteArray(false);
+                FragmentedReliableSend(fragBuffer, fragBuffer.Length);
+                return;
+            }
+
             byte[] buffer = new byte[msg.Length];
             Buffer.BlockCopy(msg.Buffer, 0, buffer, 0, msg.Length);
 
@@ -126,23 +134,25 @@ namespace Hazel.Udp
             ushort id;
             switch (message.Buffer[0])
             {
-                //Handle reliable receives
                 case (byte)SendOption.Reliable:
                     ReliableMessageReceive(message, bytesReceived);
                     break;
 
-                //Handle acknowledgments
+                case (byte)UdpSendOption.Fragment:
+                    FragmentedMessageReceive(message, bytesReceived);
+                    break;
+
                 case (byte)UdpSendOption.Acknowledgement:
                     AcknowledgementMessageReceive(message.Buffer, bytesReceived);
                     message.Recycle();
                     break;
 
-                //We need to acknowledge hello and ping messages but dont want to invoke any events!
                 case (byte)UdpSendOption.Ping:
                     ProcessReliableReceive(message.Buffer, 1, out id);
                     Statistics.LogHelloReceive(bytesReceived);
                     message.Recycle();
                     break;
+
                 case (byte)UdpSendOption.Hello:
                     ProcessReliableReceive(message.Buffer, 1, out id);
                     Statistics.LogHelloReceive(bytesReceived);
@@ -155,10 +165,15 @@ namespace Hazel.Udp
                     message.Recycle();
                     break;
                     
-                //Treat everything else as unreliable
-                default:
+                case (byte)SendOption.None:
                     InvokeDataReceived(SendOption.None, message, 1, bytesReceived);
                     Statistics.LogUnreliableReceive(bytesReceived - 1, bytesReceived);
+                    break;
+
+                // Let's fail out when getting packets we don't understand.
+                default:
+                    Disconnect($"Unrecognized packet received: {message.Buffer[0]}:{bytesReceived}");
+                    message.Recycle();
                     break;
             }
         }

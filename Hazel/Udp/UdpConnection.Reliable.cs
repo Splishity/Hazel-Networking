@@ -11,6 +11,7 @@ namespace Hazel.Udp
 {
     partial class UdpConnection
     {
+        protected const int ReliableHeaderSizeBytes = 3;
         protected const int AckSizeBytes = 7;
 
         /// <summary>
@@ -267,7 +268,7 @@ namespace Hazel.Udp
         /// <param name="ackCallback">The callback to make once the packet has been acknowledged.</param>
         private void ReliableSend(byte sendOption, byte[] data, Action ackCallback = null)
         {
-            this.ReliableSend(sendOption, data, 0, data.Length, ackCallback);
+            this.ReliableSend(sendOption, data, data.Length, ackCallback);
         }
 
         /// <summary>
@@ -278,12 +279,20 @@ namespace Hazel.Udp
         /// <param name="offset"></param>
         /// <param name="length"></param>
         /// <param name="ackCallback">The callback to make once the packet has been acknowledged.</param>
-        private void ReliableSend(byte sendOption, byte[] data, int offset, int length, Action ackCallback = null)
+        private void ReliableSend(byte sendOption, byte[] data, int length, Action ackCallback = null)
         {
             //Inform keepalive not to send for a while
             ResetKeepAliveTimer();
 
-            byte[] bytes = new byte[length + 3];
+            if (AutomaticFragmentation
+                && ackCallback == null
+                && length + ReliableHeaderSizeBytes > MTUSizeInBytes)
+            {
+                FragmentedReliableSend(data, length);
+                return;
+            }
+
+            byte[] bytes = new byte[length + ReliableHeaderSizeBytes];
 
             //Add message type
             bytes[0] = sendOption;
@@ -292,9 +301,9 @@ namespace Hazel.Udp
             AttachReliableID(bytes, 1, bytes.Length, ackCallback);
 
             //Copy data into new array
-            Buffer.BlockCopy(data, offset, bytes, bytes.Length - length, length);
+            Buffer.BlockCopy(data, 0, bytes, ReliableHeaderSizeBytes, length);
 
-            //Write to connection
+            // Write to connection
             WriteBytesToConnection(bytes, bytes.Length);
 
             Statistics.LogReliableSend(length, bytes.Length);
@@ -309,14 +318,14 @@ namespace Hazel.Udp
             ushort id;
             if (ProcessReliableReceive(message.Buffer, 1, out id))
             {
-                InvokeDataReceived(SendOption.Reliable, message, 3, bytesReceived);
+                InvokeDataReceived(SendOption.Reliable, message, ReliableHeaderSizeBytes, bytesReceived);
             }
             else
             {
                 message.Recycle();
             }
 
-            Statistics.LogReliableReceive(message.Length - 3, message.Length);
+            Statistics.LogReliableReceive(message.Length - ReliableHeaderSizeBytes, message.Length);
         }
 
         /// <summary>
@@ -385,6 +394,8 @@ namespace Hazel.Udp
                     if (id <= reliableReceiveLast)
                     {
                         uint msgBit = 1u << (reliableReceiveLast - id);
+                        if (msgBit == 0) return false;
+
                         if ((missingDataPackets & msgBit) != 0)
                         {
                             return false;
@@ -395,6 +406,8 @@ namespace Hazel.Udp
                     else
                     {
                         uint msgBit = 1u << (reliableReceiveLast + ushort.MaxValue - id);
+                        if (msgBit == 0) return false;
+
                         if ((missingDataPackets & msgBit) != 0)
                         {
                             return false;

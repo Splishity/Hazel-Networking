@@ -25,7 +25,6 @@ namespace Hazel
             this.Length = this.Buffer.Length;
         }
 
-        ///
         public MessageWriter(int bufferSize)
         {
             this.Buffer = new byte[bufferSize];

@@ -23,13 +23,15 @@ namespace Hazel
         None = 0,
 
         /// <summary>
-        ///     Requests data be sent reliably but with no fragmentation.
+        /// Requests data be sent reliably with automatic fragmentation.
         /// </summary>
         /// <remarks>
-        ///     Sending data reliably means that data is guarenteed to arrive and to arrive only once. Reliable delivery
-        ///     typically requires more processing, more memory (as packets need to be stored in case they need resending), 
-        ///     a larger number of protocol bytes and can be slower than unreliable delivery.
+        /// Sending data reliably means that data is guaranteed to arrive and to arrive only once. Reliable delivery
+        /// typically requires more processing, more memory (as packets need to be stored in case they need resending), 
+        /// a larger number of protocol bytes and can be slower than unreliable delivery.
+        ///     
+        /// Packets larger than <see cref="MTUSizeInBytes"/> will be automatically fragmented.
         /// </remarks>
-        Reliable = 1,
+        Reliable = 1
     }
 }
