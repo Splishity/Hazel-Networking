@@ -50,7 +50,7 @@ namespace Hazel.Udp
         ///     Writes the given bytes to the connection.
         /// </summary>
         /// <param name="bytes">The bytes to write.</param>
-        protected abstract void WriteBytesToConnection(byte[] bytes, int length);
+        protected abstract void WriteBytesToConnection(byte[] bytes);
 
         /// <inheritdoc/>
         public override void Send(MessageWriter msg)
@@ -66,13 +66,13 @@ namespace Hazel.Udp
                 case SendOption.Reliable:
                     ResetKeepAliveTimer();
 
-                    AttachReliableID(buffer, 1, buffer.Length);
-                    WriteBytesToConnection(buffer, buffer.Length);
+                    AttachReliableID(buffer, 1);
+                    WriteBytesToConnection(buffer);
                     Statistics.LogReliableSend(buffer.Length - 3, buffer.Length);
                     break;
 
                 default:
-                    WriteBytesToConnection(buffer, buffer.Length);
+                    WriteBytesToConnection(buffer);
                     Statistics.LogUnreliableSend(buffer.Length - 1, buffer.Length);
                     break;
             }
@@ -191,7 +191,7 @@ namespace Hazel.Udp
             Buffer.BlockCopy(data, offset, bytes, bytes.Length - length, length);
 
             //Write to connection
-            WriteBytesToConnection(bytes, bytes.Length);
+            WriteBytesToConnection(bytes);
 
             Statistics.LogUnreliableSend(length, bytes.Length);
         }

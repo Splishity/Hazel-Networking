@@ -36,7 +36,7 @@ namespace Hazel.UnitTests
             return true;
         }
 
-        protected override void WriteBytesToConnection(byte[] bytes, int length)
+        protected override void WriteBytesToConnection(byte[] bytes)
         {
             this.BytesSent.Add(MessageReader.Get(bytes));
         }

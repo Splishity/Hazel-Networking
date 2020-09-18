@@ -39,10 +39,8 @@ namespace Hazel.Udp.FewerThreads
         }
 
         /// <inheritdoc />
-        protected override void WriteBytesToConnection(byte[] bytes, int length)
+        protected override void WriteBytesToConnection(byte[] bytes)
         {
-            if (bytes.Length != length) throw new ArgumentException("I made an assumption here. I hope you see this error.");
-
             Listener.SendDataRaw(bytes, RemoteEndPoint);
         }
 

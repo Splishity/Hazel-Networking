@@ -82,7 +82,7 @@ namespace Hazel.Udp.FewerThreads
             this.EndPoint = endPoint;
             this.IPMode = ipMode;
 
-            this.receiveQueue = new BlockingCollection<ReceiveMessageInfo>(10000);
+            this.receiveQueue = new BlockingCollection<ReceiveMessageInfo>(25000);
 
             this.socket = UdpConnection.CreateSocket(this.IPMode);
             this.socket.Blocking = false;

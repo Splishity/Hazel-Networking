@@ -128,7 +128,7 @@ namespace Hazel.Udp
 
             pkt.Stopwatch.Restart();
 
-            WriteBytesToConnection(bytes, bytes.Length);
+            WriteBytesToConnection(bytes);
 
             Statistics.LogReliableSend(0, bytes.Length);
         }

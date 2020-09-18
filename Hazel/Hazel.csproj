@@ -76,6 +76,7 @@
     <Compile Include="FewerThreads\HazelThreadPool.cs" />
     <Compile Include="FewerThreads\ThreadLimitedUdpConnectionListener.cs" />
     <Compile Include="FewerThreads\ThreadLimitedUdpServerConnection.cs" />
+    <Compile Include="FewerThreads\ThreadLimitedUnityUdpClientConnection.cs" />
     <Compile Include="HazelException.cs" />
     <Compile Include="IPMode.cs" />
     <Compile Include="IRecyclable.cs" />

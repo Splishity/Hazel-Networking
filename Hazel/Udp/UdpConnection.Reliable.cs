@@ -102,7 +102,6 @@ namespace Hazel.Udp
             public ushort Id;
             private byte[] Data;
             private UdpConnection Connection;
-            private int Length;
 
             public int NextTimeout;
             public volatile bool Acknowledged;
@@ -121,7 +120,6 @@ namespace Hazel.Udp
                 this.Id = id;
                 this.Data = data;
                 this.Connection = connection;
-                this.Length = length;
 
                 this.Acknowledged = false;
                 this.NextTimeout = timeout;
@@ -142,7 +140,7 @@ namespace Hazel.Udp
                     {
                         if (connection.reliableDataPacketsSent.TryRemove(this.Id, out Packet self))
                         {
-                            connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {self.Id} (size={this.Length}) was not ack'd after {lifetime}ms ({self.Retransmissions} resends)");
+                            connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {self.Id} (size={this.Data.Length}) was not ack'd after {lifetime}ms ({self.Retransmissions} resends)");
 
                             self.Recycle();
                         }
@@ -158,7 +156,7 @@ namespace Hazel.Udp
                         {
                             if (connection.reliableDataPacketsSent.TryRemove(this.Id, out Packet self))
                             {
-                                connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {self.Id} (size={this.Length}) was not ack'd after {self.Retransmissions} resends ({lifetime}ms)");
+                                connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {self.Id} (size={this.Data.Length}) was not ack'd after {self.Retransmissions} resends ({lifetime}ms)");
 
                                 self.Recycle();
                             }
@@ -169,7 +167,7 @@ namespace Hazel.Udp
                         this.NextTimeout += (int)Math.Min(this.NextTimeout * connection.ResendPingMultiplier, 1000);
                         try
                         {
-                            connection.WriteBytesToConnection(this.Data, this.Length);
+                            connection.WriteBytesToConnection(this.Data);
                             connection.Statistics.LogMessageResent();
                             return 1;
                         }
@@ -221,7 +219,7 @@ namespace Hazel.Udp
         /// <param name="buffer">The buffer to attach to.</param>
         /// <param name="offset">The offset to attach at.</param>
         /// <param name="ackCallback">The callback to make once the packet has been acknowledged.</param>
-        protected void AttachReliableID(byte[] buffer, int offset, int sendLength, Action ackCallback = null)
+        protected void AttachReliableID(byte[] buffer, int offset, Action ackCallback = null)
         {
             ushort id = (ushort)Interlocked.Increment(ref lastIDAllocated);
 
@@ -233,7 +231,7 @@ namespace Hazel.Udp
                 id,
                 this,
                 buffer,
-                sendLength,
+                buffer.Length,
                 ResendTimeout > 0 ? ResendTimeout : (int)Math.Min(AveragePingMs * this.ResendPingMultiplier, 300),
                 ackCallback);
 
@@ -267,13 +265,13 @@ namespace Hazel.Udp
             bytes[0] = sendOption;
 
             //Add reliable ID
-            AttachReliableID(bytes, 1, bytes.Length, ackCallback);
+            AttachReliableID(bytes, 1, ackCallback);
 
             //Copy data into new array
             Buffer.BlockCopy(data, 0, bytes, bytes.Length - data.Length, data.Length);
 
             //Write to connection
-            WriteBytesToConnection(bytes, bytes.Length);
+            WriteBytesToConnection(bytes);
 
             Statistics.LogReliableSend(data.Length, bytes.Length);
         }
@@ -474,7 +472,7 @@ namespace Hazel.Udp
 
             try
             {
-                WriteBytesToConnection(bytes, bytes.Length);
+                WriteBytesToConnection(bytes);
             }
             catch (InvalidOperationException) { }
         }
