@@ -82,17 +82,19 @@ namespace Hazel.Udp.FewerThreads
             this.EndPoint = endPoint;
             this.IPMode = ipMode;
 
-            this.receiveQueue = new BlockingCollection<ReceiveMessageInfo>(25000);
-
             this.socket = UdpConnection.CreateSocket(this.IPMode);
             this.socket.Blocking = false;
 
             this.socket.ReceiveBufferSize = SendReceiveBufferSize;
             this.socket.SendBufferSize = SendReceiveBufferSize;
 
+            this.receiveQueue = new BlockingCollection<ReceiveMessageInfo>(7500);
+
             this.reliablePacketThread = new Thread(ManageReliablePackets);
             this.sendThread = new Thread(SendLoop);
+            this.sendThread.IsBackground = true;
             this.receiveThread = new Thread(ReceiveLoop);
+            this.receiveThread.IsBackground = true;
             this.processThreads = new HazelThreadPool(numWorkers, ProcessingLoop);
         }
 

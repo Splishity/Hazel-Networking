@@ -17,6 +17,7 @@ namespace Hazel
             for (int i = 0; i < this.threads.Length; ++i)
             {
                 this.threads[i] = new Thread(action);
+                this.threads[i].IsBackground = true;
             }
         }
 

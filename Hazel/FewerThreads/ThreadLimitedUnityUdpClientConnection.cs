@@ -23,11 +23,15 @@ namespace Hazel.Udp
         private Thread sendThread;
         private bool isActive = true;
 
+        private readonly ILogger logger;
+
         private BlockingCollection<byte[]> sendQueue = new BlockingCollection<byte[]>();
 
-        public ThreadLimitedUnityUdpClientConnection(IPEndPoint remoteEndPoint, IPMode ipMode = IPMode.IPv4)
+        public ThreadLimitedUnityUdpClientConnection(IPEndPoint remoteEndPoint, ILogger logger, IPMode ipMode = IPMode.IPv4)
             : base()
         {
+            this.logger = logger;
+
             this.EndPoint = remoteEndPoint;
             this.RemoteEndPoint = remoteEndPoint;
             this.IPMode = ipMode;
@@ -37,7 +41,10 @@ namespace Hazel.Udp
             this.socket.Blocking = false;
 
             this.receiveThread = new Thread(ReceiveLoop);
+            this.receiveThread.IsBackground = true;
+
             this.sendThread = new Thread(SendLoop);
+            this.sendThread.IsBackground = true;
         }
         
         ~ThreadLimitedUnityUdpClientConnection()
@@ -91,8 +98,9 @@ namespace Hazel.Udp
                         this.socket.SendTo(msg, 0, msg.Length, SocketFlags.None, this.RemoteEndPoint);
                     }
                 }
-                catch (SocketException)
+                catch (SocketException sx)
                 {
+                    this.logger.WriteInfo("Socket Exception: " + sx.Message);
                     Thread.Sleep(100);
                 }
                 catch
