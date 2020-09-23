@@ -52,7 +52,7 @@ namespace Hazel.Udp.FewerThreads
         private ConcurrentDictionary<EndPoint, ThreadLimitedUdpServerConnection> allConnections = new ConcurrentDictionary<EndPoint, ThreadLimitedUdpServerConnection>();
 
         private BlockingCollection<ReceiveMessageInfo> receiveQueue;
-        private Queue<SendMessageInfo> sendQueue = new Queue<SendMessageInfo>();
+        private BlockingCollection<SendMessageInfo> sendQueue = new BlockingCollection<SendMessageInfo>();
 
         public int MaxAge
         {
@@ -71,7 +71,7 @@ namespace Hazel.Udp.FewerThreads
         }
 
         public int ConnectionCount { get { return this.allConnections.Count; } }
-        public int SendQueueLength { get { lock(this.sendQueue) return this.sendQueue.Count; } }
+        public int SendQueueLength { get { return this.sendQueue.Count; } }
         public int ReceiveQueueLength { get { return this.receiveQueue.Count; } }
 
         private bool isActive;
@@ -91,6 +91,7 @@ namespace Hazel.Udp.FewerThreads
             this.receiveQueue = new BlockingCollection<ReceiveMessageInfo>(7500);
 
             this.reliablePacketThread = new Thread(ManageReliablePackets);
+            this.reliablePacketThread.IsBackground = true;
             this.sendThread = new Thread(SendLoop);
             this.sendThread.IsBackground = true;
             this.receiveThread = new Thread(ReceiveLoop);
@@ -122,7 +123,11 @@ namespace Hazel.Udp.FewerThreads
                 foreach (var kvp in this.allConnections)
                 {
                     var sock = kvp.Value;
-                    sock.ManageReliablePackets();
+                    try
+                    {
+                        sock.ManageReliablePackets();
+                    }
+                    catch { }
                 }
 
                 Thread.Sleep(100);
@@ -149,76 +154,85 @@ namespace Hazel.Udp.FewerThreads
 
         private void ReceiveLoop()
         {
-            while (this.isActive)
+            try
             {
-                if (this.socket.Poll(Timeout.Infinite, SelectMode.SelectRead))
+                while (this.isActive)
                 {
-                    EndPoint remoteEP = new IPEndPoint(this.EndPoint.Address, this.EndPoint.Port);
-                    MessageReader message = MessageReader.GetSized(BufferSize);
-                    try
+                    if (this.socket.Poll(Timeout.Infinite, SelectMode.SelectRead))
                     {
-                        message.Length = socket.ReceiveFrom(message.Buffer, 0, message.Buffer.Length, SocketFlags.None, ref remoteEP);
-                    }
-                    catch (SocketException sx)
-                    {
-                        message.Recycle();
-                        this.Logger.WriteError("Socket Ex in StartListening: " + sx.Message);
-                        continue;
-                    }
-                    catch (Exception ex)
-                    {
-                        message.Recycle();
-                        this.Logger.WriteError("Stopped due to: " + ex.Message);
-                        return;
-                    }
+                        EndPoint remoteEP = new IPEndPoint(this.EndPoint.Address, this.EndPoint.Port);
+                        MessageReader message = MessageReader.GetSized(BufferSize);
+                        try
+                        {
+                            message.Length = socket.ReceiveFrom(message.Buffer, 0, message.Buffer.Length, SocketFlags.None, ref remoteEP);
+                        }
+                        catch (SocketException sx)
+                        {
+                            message.Recycle();
+                            this.Logger.WriteError("Socket Ex in StartListening: " + sx.Message);
+                            continue;
+                        }
+                        catch (Exception ex)
+                        {
+                            message.Recycle();
+                            this.Logger.WriteError("Stopped due to: " + ex.Message);
+                            return;
+                        }
 
-                    this.receiveQueue.Add(new ReceiveMessageInfo() { Message = message, Sender = remoteEP });
+                        this.receiveQueue.Add(new ReceiveMessageInfo() { Message = message, Sender = remoteEP });
+                    }
                 }
+            }
+            catch (Exception iox)
+            {
+                this.Logger.WriteError("Receive loop stopped due to: " + iox.Message);
             }
         }
 
         private void ProcessingLoop()
         {
-            while (this.isActive)
+            try
             {
-                ReceiveMessageInfo msg = this.receiveQueue.Take();
-                
-                try
+                while (this.isActive)
                 {
-                    this.ReadCallback(msg.Message, msg.Sender);
-                }
-                catch
-                {
+                    if (this.receiveQueue.TryTake(out var msg, -1))
+                    {
+                        try
+                        {
+                            this.ReadCallback(msg.Message, msg.Sender);
+                        }
+                        catch
+                        {
 
+                        }
+                    }
                 }
+            }
+            catch (Exception iox)
+            {
+                this.Logger.WriteError("Processing loop stopped due to: " + iox.Message);
             }
         }
 
         private void SendLoop()
         {
-            while (this.isActive)
+            try
             {
-                SendMessageInfo msg;
-                lock (this.sendQueue)
+                while (this.isActive)
                 {
-                    if (this.sendQueue.Count == 0)
+                    if (this.sendQueue.TryTake(out var msg, -1))
                     {
-                        Monitor.Wait(this.sendQueue);
-
-                        if (this.sendQueue.Count == 0)
+                        try
                         {
-                            continue;
+                            this.socket.SendTo(msg.Buffer, 0, msg.Buffer.Length, SocketFlags.None, msg.Recipient);
                         }
+                        catch { }
                     }
-
-                    msg = this.sendQueue.Dequeue();
                 }
-
-                try
-                {
-                    this.socket.SendTo(msg.Buffer, 0, msg.Buffer.Length, SocketFlags.None, msg.Recipient);
-                }
-                catch { }
+            }
+            catch (Exception iox)
+            {
+                this.Logger.WriteError("Send loop stopped due to: " + iox.Message);
             }
         }
 
@@ -291,11 +305,11 @@ namespace Hazel.Udp.FewerThreads
 
         internal void SendDataRaw(byte[] response, EndPoint remoteEndPoint)
         {
-            lock (this.sendQueue)
+            try
             {
-                this.sendQueue.Enqueue(new SendMessageInfo() { Buffer = response, Recipient = remoteEndPoint });
-                Monitor.Pulse(this.sendQueue);
+                this.sendQueue.TryAdd(new SendMessageInfo() { Buffer = response, Recipient = remoteEndPoint }, 100);
             }
+            catch (InvalidOperationException) { }
         }
 
         /// <summary>
@@ -314,20 +328,24 @@ namespace Hazel.Udp.FewerThreads
                 kvp.Value.Dispose();
             }
 
+            Thread.Sleep(1);
+
             try { this.socket.Shutdown(SocketShutdown.Both); } catch { }
             try { this.socket.Close(); } catch { }
             try { this.socket.Dispose(); } catch { }
 
             this.isActive = false;
 
-            lock (this.sendQueue) Monitor.PulseAll(this.sendQueue);
-
-            this.receiveQueue.CompleteAdding();
+            try { this.sendQueue.CompleteAdding(); } catch { }
+            try { this.receiveQueue.CompleteAdding(); } catch { }
 
             this.reliablePacketThread.Join();
             this.sendThread.Join();
             this.receiveThread.Join();
             this.processThreads.Join();
+            
+            this.sendQueue.Dispose();
+            this.receiveQueue.Dispose();
         }
 
         public void Dispose()
