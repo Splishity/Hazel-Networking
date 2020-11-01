@@ -7,6 +7,9 @@
 *.sln.docstates
 .vs/
 
+# MacOS
+.DS_Store
+
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
