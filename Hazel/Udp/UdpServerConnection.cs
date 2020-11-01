@@ -37,9 +37,9 @@ namespace Hazel.Udp
         }
 
         /// <inheritdoc />
-        protected override void WriteBytesToConnection(byte[] bytes, int length)
+        protected override void WriteBytesToConnection(byte[] bytes)
         {
-            Listener.SendData(bytes, length, RemoteEndPoint);
+            Listener.SendData(bytes, RemoteEndPoint);
         }
 
         /// <inheritdoc />

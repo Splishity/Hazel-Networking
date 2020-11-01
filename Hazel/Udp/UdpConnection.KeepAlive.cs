@@ -74,30 +74,32 @@ namespace Hazel.Udp
         protected void InitializeKeepAliveTimer()
         {
             keepAliveTimer = new Timer(
-                (o) =>
-                {
-                    if (this.State != ConnectionState.Connected) return;
-
-                    if (this.pingsSinceAck >= this.MissingPingsUntilDisconnect)
-                    {
-                        this.DisposeKeepAliveTimer();
-                        this.DisconnectInternal(HazelInternalErrors.PingsWithoutResponse, $"Sent {this.pingsSinceAck} pings that remote has not responded to.");
-                        return;
-                    }
-
-                    try
-                    {
-                        this.pingsSinceAck++;
-                        SendPing();
-                    }
-                    catch
-                    {
-                    }
-                },
+                HandleKeepAlive,
                 null,
                 keepAliveInterval,
                 keepAliveInterval
             );
+        }
+
+        private void HandleKeepAlive(object state)
+        {
+            if (this.State != ConnectionState.Connected) return;
+
+            if (this.pingsSinceAck >= this.MissingPingsUntilDisconnect)
+            {
+                this.DisposeKeepAliveTimer();
+                this.DisconnectInternal(HazelInternalErrors.PingsWithoutResponse, $"Sent {this.pingsSinceAck} pings that remote has not responded to.");
+                return;
+            }
+
+            try
+            {
+                this.pingsSinceAck++;
+                SendPing();
+            }
+            catch
+            {
+            }
         }
 
         // Pings are special, quasi-reliable packets. 
@@ -126,7 +128,7 @@ namespace Hazel.Udp
 
             pkt.Stopwatch.Restart();
 
-            WriteBytesToConnection(bytes, bytes.Length);
+            WriteBytesToConnection(bytes);
 
             Statistics.LogReliableSend(0, bytes.Length);
         }

@@ -24,49 +24,54 @@ namespace Hazel.Udp
         public delegate bool AcceptConnectionCheck(IPEndPoint endPoint, byte[] input, out byte[] response);
 
         private Socket socket;
-        private Action<string> Logger;
-        private Timer reliablePacketTimer;
+        private ILogger Logger;
+        private Thread reliablePacketTimer;
 
         private ConcurrentDictionary<EndPoint, UdpServerConnection> allConnections = new ConcurrentDictionary<EndPoint, UdpServerConnection>();
         
         public int ConnectionCount { get { return this.allConnections.Count; } }
 
+        public int SendQueueLength;
+        public int ReceiveQueueLength;
+
+        private bool isActive;
+
         /// <summary>
         ///     Creates a new UdpConnectionListener for the given <see cref="IPAddress"/>, port and <see cref="IPMode"/>.
         /// </summary>
         /// <param name="endPoint">The endpoint to listen on.</param>
-        public UdpConnectionListener(IPEndPoint endPoint, IPMode ipMode = IPMode.IPv4, Action<string> logger = null)
+        public UdpConnectionListener(IPEndPoint endPoint, IPMode ipMode = IPMode.IPv4, ILogger logger = null)
         {
             this.Logger = logger;
             this.EndPoint = endPoint;
             this.IPMode = ipMode;
 
             this.socket = UdpConnection.CreateSocket(this.IPMode);
-
+            
             socket.ReceiveBufferSize = SendReceiveBufferSize;
             socket.SendBufferSize = SendReceiveBufferSize;
             
-            reliablePacketTimer = new Timer(ManageReliablePackets, null, 100, Timeout.Infinite);
+            reliablePacketTimer = new Thread(ManageReliablePackets);
+            reliablePacketTimer.Start();
         }
 
         ~UdpConnectionListener()
         {
             this.Dispose(false);
         }
-        
-        private void ManageReliablePackets(object state)
-        {
-            foreach (var kvp in this.allConnections)
-            {
-                var sock = kvp.Value;
-                sock.ManageReliablePackets();
-            }
 
-            try
+        private void ManageReliablePackets()
+        {
+            while (this.isActive)
             {
-                this.reliablePacketTimer.Change(100, Timeout.Infinite);
+                foreach (var kvp in this.allConnections)
+                {
+                    var sock = kvp.Value;
+                    sock.ManageReliablePackets();
+                }
+
+                Thread.Sleep(100);
             }
-            catch { }
         }
 
         /// <inheritdoc />
@@ -101,7 +106,7 @@ namespace Hazel.Udp
             {
                 message?.Recycle();
 
-                this.Logger?.Invoke("Socket Ex in StartListening: " + sx.Message);
+                this.Logger.WriteError("Socket Ex in StartListening: " + sx.Message);
 
                 Thread.Sleep(10);
                 StartListeningForData();
@@ -110,16 +115,17 @@ namespace Hazel.Udp
             catch (Exception ex)
             {
                 message.Recycle();
-                this.Logger?.Invoke("Stopped due to: " + ex.Message);
+                this.Logger.WriteError("Stopped due to: " + ex.Message);
                 return;
             }
         }
 
         void ReadCallback(IAsyncResult result)
         {
+            Interlocked.Increment(ref ReceiveQueueLength);
             var message = (MessageReader)result.AsyncState;
             int bytesReceived;
-            EndPoint remoteEndPoint = new IPEndPoint(IPMode == IPMode.IPv4 ? IPAddress.Any : IPAddress.IPv6Any, 0);
+            EndPoint remoteEndPoint = new IPEndPoint(this.EndPoint.Address, this.EndPoint.Port);
 
             //End the receive operation
             try
@@ -131,6 +137,7 @@ namespace Hazel.Udp
             }
             catch (ObjectDisposedException)
             {
+                Interlocked.Decrement(ref ReceiveQueueLength);
                 message.Recycle();
                 return;
             }
@@ -142,17 +149,19 @@ namespace Hazel.Udp
                 // This thread suggests the IP is not passed out from WinSoc so maybe not possible
                 // http://stackoverflow.com/questions/2576926/python-socket-error-on-udp-data-receive-10054
                 message.Recycle();
-                this.Logger?.Invoke($"Socket Ex {sx.SocketErrorCode} in ReadCallback: {sx.Message}");
+                this.Logger.WriteError($"Socket Ex {sx.SocketErrorCode} in ReadCallback: {sx.Message}");
 
+                Interlocked.Decrement(ref ReceiveQueueLength);
                 Thread.Sleep(10);
                 StartListeningForData();
                 return;
             }
             catch (Exception ex)
             {
+                Interlocked.Decrement(ref ReceiveQueueLength);
                 //If the socket's been disposed then we can just end there.
                 message.Recycle();
-                this.Logger?.Invoke("Stopped due to: " + ex.Message);
+                this.Logger.WriteError("Stopped due to: " + ex.Message);
                 return;
             }
 
@@ -160,8 +169,9 @@ namespace Hazel.Udp
             // to get 0 bytes read on UDP without the socket being shut down.
             if (bytesReceived == 0)
             {
+                Interlocked.Decrement(ref ReceiveQueueLength);
                 message.Recycle();
-                this.Logger?.Invoke("Received 0 bytes");
+                this.Logger.WriteError("Received 0 bytes");
                 Thread.Sleep(10);
                 StartListeningForData();
                 return;
@@ -185,6 +195,7 @@ namespace Hazel.Udp
                         // Check for malformed connection attempts
                         if (!isHello)
                         {
+                            Interlocked.Decrement(ref ReceiveQueueLength);
                             message.Recycle();
                             return;
                         }
@@ -196,9 +207,10 @@ namespace Hazel.Udp
                                 message.Recycle();
                                 if (response != null)
                                 {
-                                    SendData(response, response.Length, remoteEndPoint);
+                                    SendData(response, remoteEndPoint);
                                 }
 
+                                Interlocked.Decrement(ref ReceiveQueueLength);
                                 return;
                             }
                         }
@@ -225,13 +237,15 @@ namespace Hazel.Udp
                 InvokeNewConnection(message, connection);
             }
 
-            //Inform the connection of the buffer (new connections need to send an ack back to client)
+            // Inform the connection of the buffer (new connections need to send an ack back to client)
             connection.HandleReceive(message, bytesReceived);
 
             if (aware && isHello)
             {
                 message.Recycle();
             }
+
+            Interlocked.Decrement(ref ReceiveQueueLength);
         }
 
 #if DEBUG
@@ -244,10 +258,8 @@ namespace Hazel.Udp
         /// </summary>
         /// <param name="bytes">The bytes to send.</param>
         /// <param name="endPoint">The endpoint to send to.</param>
-        internal void SendData(byte[] bytes, int length, EndPoint endPoint)
+        internal void SendData(byte[] bytes, EndPoint endPoint)
         {
-            if (length > bytes.Length) return;
-
 #if DEBUG
             if (TestDropRate > 0)
             {
@@ -257,13 +269,14 @@ namespace Hazel.Udp
                 }
             }
 #endif
+            Interlocked.Increment(ref SendQueueLength);
 
             try
             {
                 socket.BeginSendTo(
                     bytes,
                     0,
-                    length,
+                    bytes.Length,
                     SocketFlags.None,
                     endPoint,
                     SendCallback,
@@ -284,6 +297,7 @@ namespace Hazel.Udp
         {
             try
             {
+                Interlocked.Decrement(ref ReceiveQueueLength);
                 socket.EndSendTo(result);
             }
             catch { }
@@ -326,11 +340,13 @@ namespace Hazel.Udp
                 kvp.Value.Dispose();
             }
 
+            isActive = false;
+
             try { this.socket.Shutdown(SocketShutdown.Both); } catch { }
             try { this.socket.Close(); } catch { }
             try { this.socket.Dispose(); } catch { }
 
-            this.reliablePacketTimer.Dispose();
+            reliablePacketTimer.Join();
 
             base.Dispose(disposing);
         }

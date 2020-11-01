@@ -61,24 +61,24 @@ namespace Hazel.Udp
         }
 
         /// <inheritdoc />
-        protected override void WriteBytesToConnection(byte[] bytes, int length)
+        protected override void WriteBytesToConnection(byte[] bytes)
         {
 #if DEBUG
             if (TestLagMs > 0)
             {
-                ThreadPool.QueueUserWorkItem(a => { Thread.Sleep(this.TestLagMs); WriteBytesToConnectionReal(bytes, length); });
+                ThreadPool.QueueUserWorkItem(a => { Thread.Sleep(this.TestLagMs); WriteBytesToConnectionReal(bytes); });
             }
             else
 #endif
             {
-                WriteBytesToConnectionReal(bytes, length);
+                WriteBytesToConnectionReal(bytes);
             }
         }
 
-        private void WriteBytesToConnectionReal(byte[] bytes, int length)
+        private void WriteBytesToConnectionReal(byte[] bytes)
         {
 #if DEBUG
-            DataSentRaw?.Invoke(bytes, length);
+            DataSentRaw?.Invoke(bytes, bytes.Length);
 #endif
 
             try
@@ -86,7 +86,7 @@ namespace Hazel.Udp
                 socket.BeginSendTo(
                     bytes,
                     0,
-                    length,
+                    bytes.Length,
                     SocketFlags.None,
                     RemoteEndPoint,
                     HandleSendTo,

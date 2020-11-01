@@ -49,19 +49,14 @@ namespace Hazel.Udp
         internal ConcurrentDictionary<ushort, Packet> reliableDataPacketsSent = new ConcurrentDictionary<ushort, Packet>();
 
         /// <summary>
-        ///     The last packets that were received.
+        ///     Packet ids that have not been received, but are expected. 
         /// </summary>
         private HashSet<ushort> reliableDataPacketsMissing = new HashSet<ushort>();
 
         /// <summary>
         ///     The packet id that was received last.
         /// </summary>
-        private volatile ushort reliableReceiveLast = 0;
-
-        /// <summary>
-        ///     Has the connection received anything yet
-        /// </summary>
-        private volatile bool hasReceivedSomething = false;
+        private volatile ushort reliableReceiveLast = ushort.MaxValue;
 
         private object PingLock = new object();
 
@@ -107,7 +102,6 @@ namespace Hazel.Udp
             public ushort Id;
             private byte[] Data;
             private UdpConnection Connection;
-            private int Length;
 
             public int NextTimeout;
             public volatile bool Acknowledged;
@@ -126,7 +120,6 @@ namespace Hazel.Udp
                 this.Id = id;
                 this.Data = data;
                 this.Connection = connection;
-                this.Length = length;
 
                 this.Acknowledged = false;
                 this.NextTimeout = timeout;
@@ -147,7 +140,7 @@ namespace Hazel.Udp
                     {
                         if (connection.reliableDataPacketsSent.TryRemove(this.Id, out Packet self))
                         {
-                            connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {self.Id} (size={this.Length}) was not ack'd after {lifetime}ms ({self.Retransmissions} resends)");
+                            connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {self.Id} (size={this.Data.Length}) was not ack'd after {lifetime}ms ({self.Retransmissions} resends)");
 
                             self.Recycle();
                         }
@@ -163,7 +156,7 @@ namespace Hazel.Udp
                         {
                             if (connection.reliableDataPacketsSent.TryRemove(this.Id, out Packet self))
                             {
-                                connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {self.Id} (size={this.Length}) was not ack'd after {self.Retransmissions} resends ({lifetime}ms)");
+                                connection.DisconnectInternal(HazelInternalErrors.ReliablePacketWithoutResponse, $"Reliable packet {self.Id} (size={this.Data.Length}) was not ack'd after {self.Retransmissions} resends ({lifetime}ms)");
 
                                 self.Recycle();
                             }
@@ -174,7 +167,7 @@ namespace Hazel.Udp
                         this.NextTimeout += (int)Math.Min(this.NextTimeout * connection.ResendPingMultiplier, 1000);
                         try
                         {
-                            connection.WriteBytesToConnection(this.Data, this.Length);
+                            connection.WriteBytesToConnection(this.Data);
                             connection.Statistics.LogMessageResent();
                             return 1;
                         }
@@ -226,7 +219,7 @@ namespace Hazel.Udp
         /// <param name="buffer">The buffer to attach to.</param>
         /// <param name="offset">The offset to attach at.</param>
         /// <param name="ackCallback">The callback to make once the packet has been acknowledged.</param>
-        private void AttachReliableID(byte[] buffer, int offset, int sendLength, Action ackCallback = null)
+        protected void AttachReliableID(byte[] buffer, int offset, Action ackCallback = null)
         {
             ushort id = (ushort)Interlocked.Increment(ref lastIDAllocated);
 
@@ -238,7 +231,7 @@ namespace Hazel.Udp
                 id,
                 this,
                 buffer,
-                sendLength,
+                buffer.Length,
                 ResendTimeout > 0 ? ResendTimeout : (int)Math.Min(AveragePingMs * this.ResendPingMultiplier, 300),
                 ackCallback);
 
@@ -263,37 +256,24 @@ namespace Hazel.Udp
         /// <param name="ackCallback">The callback to make once the packet has been acknowledged.</param>
         private void ReliableSend(byte sendOption, byte[] data, Action ackCallback = null)
         {
-            this.ReliableSend(sendOption, data, 0, data.Length, ackCallback);
-        }
-
-        /// <summary>
-        ///     Sends the bytes reliably and stores the send.
-        /// </summary>
-        /// <param name="sendOption"></param>
-        /// <param name="data">The byte array to write to.</param>
-        /// <param name="offset"></param>
-        /// <param name="length"></param>
-        /// <param name="ackCallback">The callback to make once the packet has been acknowledged.</param>
-        private void ReliableSend(byte sendOption, byte[] data, int offset, int length, Action ackCallback = null)
-        {
             //Inform keepalive not to send for a while
             ResetKeepAliveTimer();
 
-            byte[] bytes = new byte[length + 3];
+            byte[] bytes = new byte[data.Length + 3];
 
             //Add message type
             bytes[0] = sendOption;
 
             //Add reliable ID
-            AttachReliableID(bytes, 1, bytes.Length, ackCallback);
+            AttachReliableID(bytes, 1, ackCallback);
 
             //Copy data into new array
-            Buffer.BlockCopy(data, offset, bytes, bytes.Length - length, length);
+            Buffer.BlockCopy(data, 0, bytes, bytes.Length - data.Length, data.Length);
 
             //Write to connection
-            WriteBytesToConnection(bytes, bytes.Length);
+            WriteBytesToConnection(bytes);
 
-            Statistics.LogReliableSend(length, bytes.Length);
+            Statistics.LogReliableSend(data.Length, bytes.Length);
         }
 
         /// <summary>
@@ -330,7 +310,7 @@ namespace Hazel.Udp
             id = (ushort)((b1 << 8) + b2);
 
             //Send an acknowledgement
-            SendAck(b1, b2);
+            SendAck(id);
 
             /*
              * It gets a little complicated here (note the fact I'm actually using a multiline comment for once...)
@@ -370,17 +350,27 @@ namespace Hazel.Udp
                     isNew = id > reliableReceiveLast && id <= overwritePointer;     //Figure (3)
                 
                 //If it's new or we've not received anything yet
-                if (isNew || !hasReceivedSomething)
+                if (isNew)
                 {
-                    //Mark items between the most recent receive and the id received as missing
-                    for (ushort i = (ushort)(reliableReceiveLast + 1); i < id; i++)
+                    // Mark items between the most recent receive and the id received as missing
+                    if (id > reliableReceiveLast)
                     {
-                        reliableDataPacketsMissing.Add(i);
+                        for (ushort i = (ushort)(reliableReceiveLast + 1); i < id; i++)
+                        {
+                            reliableDataPacketsMissing.Add(i);
+                        }
+                    }
+                    else
+                    {
+                        int cnt = (ushort.MaxValue - reliableReceiveLast) + id;
+                        for (ushort i = 1; i < cnt; ++i)
+                        {
+                            reliableDataPacketsMissing.Add((ushort)(i + reliableReceiveLast));
+                        }
                     }
 
                     //Update the most recently received
                     reliableReceiveLast = id;
-                    hasReceivedSomething = true;
                 }
                 
                 //Else it could be a missing packet
@@ -405,9 +395,28 @@ namespace Hazel.Udp
         {
             this.pingsSinceAck = 0;
 
-            //Get ID
             ushort id = (ushort)((bytes[1] << 8) + bytes[2]);
+            AcknowledgeMessageId(id);
 
+            if (bytesReceived == 4)
+            {
+                byte recentPackets = bytes[3];
+                for (int i = 1; i <= 8; ++i)
+                {
+                    if ((recentPackets & 1) != 0)
+                    {
+                        AcknowledgeMessageId((ushort)(id - i));
+                    }
+
+                    recentPackets >>= 1;
+                }
+            }
+
+            Statistics.LogReliableReceive(0, bytesReceived);
+        }
+
+        private void AcknowledgeMessageId(ushort id)
+        {
             // Dispose of timer and remove from dictionary
             if (reliableDataPacketsSent.TryRemove(id, out Packet packet))
             {
@@ -432,8 +441,6 @@ namespace Hazel.Udp
                     this.AveragePingMs = Math.Max(50, this.AveragePingMs * .7f + rt * .3f);
                 }
             }
-
-            Statistics.LogReliableReceive(bytesReceived - 3, bytesReceived);
         }
 
         /// <summary>
@@ -441,20 +448,31 @@ namespace Hazel.Udp
         /// </summary>
         /// <param name="byte1">The first identification byte.</param>
         /// <param name="byte2">The second identification byte.</param>
-        private void SendAck(byte byte1, byte byte2)
+        private void SendAck(ushort id)
         {
+            byte recentPackets = 0;
+            lock (this.reliableDataPacketsMissing)
+            {
+                for (int i = 1; i <= 8; ++i)
+                {
+                    if (!this.reliableDataPacketsMissing.Contains((ushort)(id - i)))
+                    {
+                        recentPackets |= (byte)(1 << (i - 1));
+                    }
+                }
+            }
+
             byte[] bytes = new byte[]
             {
                 (byte)UdpSendOption.Acknowledgement,
-                byte1,
-                byte2
+                (byte)(id >> 8),
+                (byte)(id >> 0),
+                recentPackets
             };
 
-            // Always reply with acknowledgement in order to stop the sender repeatedly sending it
-            // TODO: group acks together
             try
             {
-                WriteBytesToConnection(bytes, bytes.Length);
+                WriteBytesToConnection(bytes);
             }
             catch (InvalidOperationException) { }
         }

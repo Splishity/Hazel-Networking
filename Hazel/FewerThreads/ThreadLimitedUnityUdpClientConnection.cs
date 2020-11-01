@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -11,22 +13,41 @@ namespace Hazel.Udp
     /// Be very careful since this interface is likely unstable or actively changing
     /// </summary>
     /// <inheritdoc/>
-    public class UnityUdpClientConnection : UdpConnection
+    public class ThreadLimitedUnityUdpClientConnection : UdpConnection
     {
+        private const int BufferSize = ushort.MaxValue;
+        
         private Socket socket;
 
-        public UnityUdpClientConnection(IPEndPoint remoteEndPoint, IPMode ipMode = IPMode.IPv4)
+        private Thread receiveThread;
+        private Thread sendThread;
+        private bool isActive = true;
+
+        private readonly ILogger logger;
+
+        private BlockingCollection<byte[]> sendQueue = new BlockingCollection<byte[]>();
+
+        public ThreadLimitedUnityUdpClientConnection(IPEndPoint remoteEndPoint, ILogger logger, IPMode ipMode = IPMode.IPv4)
             : base()
         {
+            this.logger = logger;
+
             this.EndPoint = remoteEndPoint;
             this.RemoteEndPoint = remoteEndPoint;
             this.IPMode = ipMode;
 
             this.socket = CreateSocket(ipMode);
             this.socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ExclusiveAddressUse, true);
+            this.socket.Blocking = false;
+
+            this.receiveThread = new Thread(ReceiveLoop);
+            this.receiveThread.IsBackground = true;
+
+            this.sendThread = new Thread(SendLoop);
+            this.sendThread.IsBackground = true;
         }
         
-        ~UnityUdpClientConnection()
+        ~ThreadLimitedUnityUdpClientConnection()
         {
             this.Dispose(false);
         }
@@ -36,45 +57,69 @@ namespace Hazel.Udp
             base.ManageReliablePackets();
         }
 
+        private void ReceiveLoop()
+        {
+            EndPoint remoteEP = new IPEndPoint(this.EndPoint.Address, this.EndPoint.Port);
+            while (this.isActive)
+            {
+                if (this.socket.Poll(Timeout.Infinite, SelectMode.SelectRead))
+                {
+                    MessageReader message = MessageReader.GetSized(BufferSize);
+                    try
+                    {
+                        message.Length = socket.ReceiveFrom(message.Buffer, 0, message.Buffer.Length, SocketFlags.None, ref remoteEP);
+                    }
+                    catch (Exception)
+                    {
+                        message.Recycle();
+                        return;
+                    }
+
+                    if (message.Length == 0)
+                    {
+                        message.Recycle();
+                        DisconnectInternal(HazelInternalErrors.ReceivedZeroBytes, "Received 0 bytes");
+                        return;
+                    }
+
+                    HandleReceive(message, message.Length);
+                }
+            }
+        }
+
+        private void SendLoop()
+        {
+            while (this.isActive)
+            {
+                try
+                {
+                    while (this.sendQueue.TryTake(out var msg, -1))
+                    {
+                        this.socket.SendTo(msg, 0, msg.Length, SocketFlags.None, this.RemoteEndPoint);
+                    }
+                }
+                catch (SocketException sx)
+                {
+                    this.logger.WriteInfo("Socket Exception: " + sx.Message);
+                    Thread.Sleep(100);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+        }
+
         /// <inheritdoc />
         protected override void WriteBytesToConnection(byte[] bytes)
         {
             try
             {
-                socket.BeginSendTo(
-                    bytes,
-                    0,
-                    bytes.Length,
-                    SocketFlags.None,
-                    RemoteEndPoint,
-                    HandleSendTo,
-                    null);
+                this.sendQueue.TryAdd(bytes);
             }
-            catch (NullReferenceException) { }
-            catch (ObjectDisposedException)
+            catch
             {
-                // Already disposed and disconnected...
-            }
-            catch (SocketException ex)
-            {
-                DisconnectInternal(HazelInternalErrors.SocketExceptionSend, "Could not send data as a SocketException occurred: " + ex.Message);
-            }
-        }
 
-        private void HandleSendTo(IAsyncResult result)
-        {
-            try
-            {
-                socket.EndSendTo(result);
-            }
-            catch (NullReferenceException) { }
-            catch (ObjectDisposedException)
-            {
-                // Already disposed and disconnected...
-            }
-            catch (SocketException ex)
-            {
-                DisconnectInternal(HazelInternalErrors.SocketExceptionSend, "Could not send data as a SocketException occurred: " + ex.Message);
             }
         }
 
@@ -103,7 +148,8 @@ namespace Hazel.Udp
 
             try
             {
-                StartListeningForData();
+                this.sendThread.Start();
+                this.receiveThread.Start();
             }
             catch (ObjectDisposedException)
             {
@@ -126,75 +172,6 @@ namespace Hazel.Udp
             });
 
             this.InitializeKeepAliveTimer();
-        }
-
-        /// <summary>
-        ///     Instructs the listener to begin listening.
-        /// </summary>
-        void StartListeningForData()
-        {
-            var msg = MessageReader.GetSized(ushort.MaxValue);
-            try
-            {
-                var ep = this.RemoteEndPoint;
-                socket.BeginReceiveFrom(msg.Buffer, 0, msg.Buffer.Length, SocketFlags.None, ref ep, ReadCallback, msg);
-            }
-            catch
-            {
-                msg.Recycle();
-                this.Dispose();
-            }
-        }
-
-        /// <summary>
-        ///     Called when data has been received by the socket.
-        /// </summary>
-        /// <param name="result">The asyncronous operation's result.</param>
-        void ReadCallback(IAsyncResult result)
-        {
-            var msg = (MessageReader)result.AsyncState;
-
-            try
-            {
-                var ep = this.RemoteEndPoint;
-                msg.Length = socket.EndReceiveFrom(result, ref ep);
-            }
-            catch (SocketException e)
-            {
-                msg.Recycle();
-                DisconnectInternal(HazelInternalErrors.SocketExceptionReceive, "Socket exception while reading data: " + e.Message);
-                return;
-            }
-            catch (Exception)
-            {
-                msg.Recycle();
-                return;
-            }
-
-            //Exit if no bytes read, we've failed.
-            if (msg.Length == 0)
-            {
-                msg.Recycle();
-                DisconnectInternal(HazelInternalErrors.ReceivedZeroBytes, "Received 0 bytes");
-                return;
-            }
-
-            //Begin receiving again
-            try
-            {
-                StartListeningForData();
-            }
-            catch (SocketException e)
-            {
-                DisconnectInternal(HazelInternalErrors.SocketExceptionReceive, "Socket exception during receive: " + e.Message);
-            }
-            catch (ObjectDisposedException)
-            {
-                //If the socket's been disposed then we can just end there.
-                return;
-            }
-
-            HandleReceive(msg, msg.Length);
         }
 
         /// <summary>
@@ -239,6 +216,9 @@ namespace Hazel.Udp
             {
                 SendDisconnect();
             }
+
+            this.isActive = false;
+            this.sendQueue.CompleteAdding();
 
             try { this.socket.Shutdown(SocketShutdown.Both); } catch { }
             try { this.socket.Close(); } catch { }
