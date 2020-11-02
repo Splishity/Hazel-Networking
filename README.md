@@ -1,3 +1,5 @@
+# Hazel
+![Build](https://github.com/Splishity/Hazel-Networking/workflows/Build/badge.svg)
 #### Hazel Networking is a low-level networking library for C# providing connection-oriented, message based communication via UDP and RUDP.
 
 The aim of this fork is to create a simple interface for ultra-fast connection-based UDP communication for games.
